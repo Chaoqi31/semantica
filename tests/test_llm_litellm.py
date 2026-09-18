@@ -255,15 +255,13 @@ def test_generate_structured_prefers_earlier_json_boundary(litellm_available, mo
 
 def _make_litellm_with_response(monkeypatch, content: str) -> "LiteLLM":
     """Return a LiteLLM instance whose completion call returns *content*."""
-    import semantica.llms.litellm as _mod
-
     fake_message = MagicMock()
     fake_message.content = content
     fake_choice = MagicMock()
     fake_choice.message = fake_message
     fake_response = MagicMock()
     fake_response.choices = [fake_choice]
-    monkeypatch.setattr(_mod, "completion", lambda **kw: fake_response)
+    monkeypatch.setattr(litellm_module, "completion", lambda **kw: fake_response)
     return LiteLLM(model="openai/gpt-4o", api_key="k")
 
 
