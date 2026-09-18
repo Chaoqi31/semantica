@@ -292,18 +292,22 @@ class LLMExtraction:
 
         Calls the configured LLM provider with a structured prompt, parses the
         response using :class:`~.schemas.RelationsResponse`, and merges the
-        result back into the original relation list:
+        result back into the original relation list.
 
-        - Existing relations whose ``(subject.text, object.text)`` pair matches
-          an LLM-returned relation (case-insensitive) have their ``predicate``
-          and ``confidence`` updated.  When multiple relations share the same
-          subject/object pair, **all** matching relations are updated.
-        - New relations returned by the LLM whose ``(subject, object)`` pair is
-          not present in the original list are appended.  Subject/object entities
-          are resolved against the canonical entity pool from the original
-          relations; unresolved endpoints become synthetic UNKNOWN entities
-          (consistent with :func:`~.methods._parse_relation_result`).
-        - Original relations not affected by the LLM response are preserved.
+        The prompt sends all existing relations — **including their predicates**
+        — to the LLM.  The LLM therefore knows the full
+        ``(subject, predicate, object)`` context when it responds, which drives
+        the merge strategy:
+
+        - An LLM-returned triple whose ``(subject.text, predicate, object.text)``
+          exactly matches an existing relation (case-insensitive) has its
+          ``confidence`` updated.  The predicate is already correct.
+        - An LLM-returned triple with no exact match in the original list is
+          **appended** as a new relation, regardless of whether the
+          ``(subject, object)`` pair already exists with a different predicate.
+          Enhancement is additive: existing graph edges are never silently
+          deleted.
+        - Original relations absent from the LLM response are **preserved**.
         - All returned relations carry ``enhanced_by`` and ``model`` metadata.
 
         Falls back to the original relations on any LLM or parsing failure.
@@ -530,29 +534,42 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
         """Merge the LLM-returned :class:`~.schemas.RelationsResponse` into
         the original relation list.
 
-        Merge strategy:
+        Merge strategy
+        --------------
+        The enhancement prompt sends *all* existing relations to the LLM,
+        including their current predicates.  The LLM therefore knows the exact
+        ``(subject, predicate, object)`` triple when it decides how to respond.
 
-        * For every relation returned by the LLM, look for **all** existing
-          relations whose ``(subject.text, object.text)`` pair matches
-          (case-insensitive).  Each match has its ``predicate`` and
-          ``confidence`` updated.  This is the intended enhancement contract:
-          the LLM can correct a generic "related_to" predicate to a specific
-          "founded_by" predicate.  When multiple relations share the same
-          endpoints, all of them receive the updated predicate and confidence.
-        * LLM-returned relations whose ``(subject, object)`` pair is not present
-          in the original list are **appended** as new relations.  Subject/object
-          entities are resolved against the canonical entity pool from the
-          original relations; unresolved endpoints become synthetic UNKNOWN
-          entities (consistent with :func:`~.methods._parse_relation_result`).
-        * Original relations not affected by the LLM response are **preserved**.
+        * **Exact triple match** ``(subject.text, predicate, object.text)`` —
+          all case-insensitive: the LLM confirmed or fine-tuned this relation.
+          Only its ``confidence`` is updated; the predicate does not change
+          because the LLM echoed it back unchanged.
+        * **New triple** — the LLM's ``(subject, predicate, object)`` is not
+          present in the original list (including the case where the LLM
+          returns a more specific predicate for an existing ``(subject, object)``
+          pair): treated as a new relation and **appended**.  The original
+          relation with the old predicate is **preserved** — enhancement is
+          additive; it never silently deletes existing graph edges.
+        * **Truly new pair** — ``(subject, object)`` not present anywhere in
+          the original list: appended as a new relation.  Subject/object
+          entities are resolved against the canonical entity pool; unresolved
+          endpoints become synthetic UNKNOWN entities (consistent with
+          :func:`~.methods._parse_relation_result`).
+        * Original relations absent from the LLM response are **preserved**.
         * All returned relations carry ``enhanced_by`` / ``model`` metadata.
-        * Empty/unusable responses preserve the original list unchanged.
+        * Empty/unusable responses return the original list unchanged.
 
-        Note on duplicate input relations: if the original list already contains
-        duplicate ``(subject, predicate, object)`` triples, only the first
-        occurrence's index is tracked.  The enhancement update still applies to
-        that first copy; later duplicates are preserved unchanged and carry the
-        ``enhanced_by`` stamp from the final metadata pass.
+        Why ``(subject, predicate, object)`` identity?
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Using only ``(subject, object)`` would cause every relation between the
+        same two endpoints to have its predicate blindly overwritten by a single
+        LLM entry — e.g. an LLM response for ``founded_by`` would silently
+        change an independent ``employs`` relation to ``founded_by`` as well.
+        Triple-level matching prevents this while still supporting the common
+        "verify / confirm" enhancement use case where the LLM echoes back a
+        relation that was already correct.  Predicate *correction* manifests
+        as an appended new relation; the stale original remains in the graph
+        and can be pruned deliberately if required.
         """
         llm_relations = getattr(response_obj, "relations", None)
         if not llm_relations:
@@ -565,11 +582,12 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 rel.metadata.update({"enhanced_by": self.provider_name, "model": self.model})
             return original_relations
 
-        # Build a lookup: (subj_lower, obj_lower) → list of indices in working
-        # copy.  Using a list correctly handles multiple relations with the same
-        # endpoints but different predicates — all are updated together.
+        # Build a lookup: (subj_lower, predicate_lower, obj_lower) → index.
+        # Using the full triple as the key means that two relations sharing the
+        # same endpoints but carrying different predicates are treated as
+        # independent relations and cannot overwrite each other.
         working: List[Relation] = []
-        pair_to_indices: Dict[tuple, List[int]] = {}
+        triple_to_idx: Dict[tuple, int] = {}
         for rel in original_relations:
             idx = len(working)
             new_meta = dict(rel.metadata) if rel.metadata else {}
@@ -581,8 +599,15 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 context=rel.context,
                 metadata=new_meta,
             ))
-            pair_key = (rel.subject.text.lower(), rel.object.text.lower())
-            pair_to_indices.setdefault(pair_key, []).append(idx)
+            triple_key = (
+                rel.subject.text.lower(),
+                rel.predicate.lower(),
+                rel.object.text.lower(),
+            )
+            # Keep first occurrence only (guards against pre-existing duplicates
+            # in the caller's input; duplicates are still preserved in `working`
+            # and receive the metadata stamp from the final pass below).
+            triple_to_idx.setdefault(triple_key, idx)
 
         # Build a flat entity pool from original relations for endpoint resolution
         entity_pool: List[Entity] = []
@@ -594,7 +619,7 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                     entity_pool.append(ent)
                     seen_ent_texts.add(t)
 
-        seen_new: set = set()  # guard against duplicate new relations
+        seen_new: set = set()  # guard against duplicate new triples
 
         for r_out in llm_relations:
             subj_text = (r_out.subject or "").strip()
@@ -603,24 +628,26 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
             if not subj_text or not obj_text:
                 continue
 
-            pair_key = (subj_text.lower(), obj_text.lower())
+            triple_key = (
+                subj_text.lower(),
+                pred_text.lower(),
+                obj_text.lower(),
+            )
 
-            if pair_key in pair_to_indices:
-                # Update every relation with this subject/object pair
-                for idx in pair_to_indices[pair_key]:
-                    existing = working[idx]
-                    if pred_text:
-                        existing.predicate = pred_text
-                    if r_out.confidence is not None:
-                        existing.confidence = r_out.confidence
-                    existing.metadata.update({
-                        "enhanced_by": self.provider_name,
-                        "model": self.model,
-                    })
+            if triple_key in triple_to_idx:
+                # Exact triple match — update only confidence; predicate is
+                # unchanged because the LLM echoed it back.
+                existing = working[triple_to_idx[triple_key]]
+                if r_out.confidence is not None:
+                    existing.confidence = r_out.confidence
+                existing.metadata.update({
+                    "enhanced_by": self.provider_name,
+                    "model": self.model,
+                })
             else:
-                # New relation — append once per unique (subj, obj) pair
-                if pair_key not in seen_new:
-                    seen_new.add(pair_key)
+                # No matching triple — append once per unique triple
+                if triple_key not in seen_new:
+                    seen_new.add(triple_key)
 
                     # Resolve endpoints against the canonical entity pool
                     subj_entity = next(

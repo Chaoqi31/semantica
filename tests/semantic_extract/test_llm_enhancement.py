@@ -395,29 +395,15 @@ class TestNoDuplicateEntities:
 # ---------------------------------------------------------------------------
 
 class TestEnhanceRelationsPredicateUpdate:
-    """Test 11 – LLM corrects an existing relation's predicate via (subj, obj) matching."""
+    """Test 11 – Relation enhancement matching uses (subject, predicate, object) identity.
 
-    def test_predicate_is_updated(self):
-        """The enhancement contract: matching on (subject, object) allows the LLM
-        to correct a generic predicate to a specific one."""
-        original = [_make_relation("Apple Inc.", "related_to", "Steve Jobs")]
+    The prompt sends all existing relations WITH their predicates to the LLM, so
+    the LLM has full context.  An exact-triple match updates confidence; a
+    response with a different predicate is additive (new relation appended).
+    """
 
-        llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by",
-                        object="Steve Jobs", confidence=0.97),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_relations(
-            "Apple Inc. was founded by Steve Jobs.", original
-        )
-
-        assert len(result) == 1
-        assert result[0].predicate == "founded_by", (
-            "LLM-suggested predicate must replace the original one"
-        )
-
-    def test_exact_match_updates_confidence(self):
-        """When the LLM returns the same predicate as already present, only confidence changes."""
+    def test_exact_triple_match_updates_confidence(self):
+        """When the LLM returns the same (subj, pred, obj), only confidence changes."""
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.5)]
 
         llm_resp = RelationsResponse(relations=[
@@ -430,6 +416,26 @@ class TestEnhanceRelationsPredicateUpdate:
         assert len(result) == 1
         assert result[0].predicate == "founded_by"
         assert result[0].confidence == pytest.approx(0.99)
+
+    def test_new_predicate_is_appended_not_overwritten(self):
+        """When the LLM returns a different predicate for an existing (subj, obj),
+        the result is additive: original is preserved and new predicate is appended.
+        Enhancement never silently deletes existing graph edges."""
+        original = [_make_relation("Apple Inc.", "related_to", "Steve Jobs")]
+
+        llm_resp = RelationsResponse(relations=[
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_relations(
+            "Apple Inc. was founded by Steve Jobs.", original
+        )
+
+        predicates = {r.predicate for r in result}
+        assert "related_to" in predicates, "Original relation must be preserved"
+        assert "founded_by" in predicates, "LLM-suggested new predicate must be appended"
+        assert len(result) == 2
 
 
 class TestEnhanceRelationsConfidenceUpdate:
@@ -610,50 +616,72 @@ class TestNoDuplicateRelations:
 
 
 # ---------------------------------------------------------------------------
-# Relation enhancement — multiple predicates same endpoints (Finding 7)
+# Relation enhancement — multiple predicates same endpoints (core correctness)
 # ---------------------------------------------------------------------------
 
 class TestMultiplePredicatesSameEndpoints:
-    """Test 19 — Multiple relations with same endpoints but different predicates
-    are ALL corrected when the LLM returns an update for that (subj, obj) pair."""
+    """Tests 19 — Multiple relations with the same endpoints but different
+    predicates must remain independent.  An LLM response for one predicate
+    must not overwrite the other."""
 
-    def test_all_predicates_updated_for_same_pair(self):
-        """If the original has two relations between A and B, an LLM update for
-        the (A, B) pair applies to both."""
+    def test_unrelated_predicate_not_overwritten(self):
+        """Core correctness: Apple→founded_by→Jobs and Apple→employs→Jobs.
+        LLM returns founded_by — employs must NOT be changed."""
         original = [
-            _make_relation("Apple Inc.", "related_to", "Steve Jobs"),
+            _make_relation("Apple Inc.", "founded_by", "Steve Jobs"),
             _make_relation("Apple Inc.", "employs", "Steve Jobs"),
         ]
-        # LLM returns founded_by for the (Apple, Jobs) pair
         llm_resp = RelationsResponse(relations=[
             RelationOut(subject="Apple Inc.", predicate="founded_by",
-                        object="Steve Jobs", confidence=0.97),
+                        object="Steve Jobs", confidence=0.99),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
 
-        # Both existing relations should be updated
-        assert len(result) == 2
-        for r in result:
-            assert r.predicate == "founded_by", (
-                "All relations with same endpoints should have predicate updated"
-            )
+        assert len(result) == 2, "Both original relations must be preserved"
+        predicates = {r.predicate for r in result}
+        assert "founded_by" in predicates
+        assert "employs" in predicates, (
+            "employs relation must not be overwritten by the founded_by LLM response"
+        )
 
-    def test_two_original_predicates_receive_llm_predicate(self):
-        """When multiple relations share the same (subj, obj), the LLM-provided
-        predicate replaces each original predicate."""
+    def test_founded_by_confidence_updated_employs_unchanged(self):
+        """founded_by confidence must be updated; employs confidence must stay unchanged."""
         original = [
-            _make_relation("A", "x", "B"),
-            _make_relation("A", "y", "B"),
+            _make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.5),
+            _make_relation("Apple Inc.", "employs", "Steve Jobs", confidence=0.8),
         ]
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="A", predicate="z", object="B", confidence=0.9),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.99),
         ])
         extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_relations("A and B", original)
+        result = extractor.enhance_relations("text", original)
+
+        founded = next(r for r in result if r.predicate == "founded_by")
+        employs = next(r for r in result if r.predicate == "employs")
+        assert founded.confidence == pytest.approx(0.99)
+        assert employs.confidence == pytest.approx(0.8), (
+            "employs confidence must be unchanged"
+        )
+
+    def test_llm_can_add_second_predicate_between_same_pair(self):
+        """LLM can legitimately add a second predicate between an existing pair."""
+        original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
+
+        llm_resp = RelationsResponse(relations=[
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.99),
+            RelationOut(subject="Apple Inc.", predicate="employs",
+                        object="Steve Jobs", confidence=0.85),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_relations("text", original)
 
         predicates = {r.predicate for r in result}
-        assert predicates == {"z"}, "Both relations must receive the corrected predicate"
+        assert "founded_by" in predicates
+        assert "employs" in predicates
+        assert len(result) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +817,10 @@ class TestCaseInsensitiveMatching:
         assert result[0].label == "ORG"
 
     def test_relation_match_is_case_insensitive(self):
-        """Test 25: relation (subj, obj) matched case-insensitively."""
-        original = [_make_relation("apple inc.", "related_to", "steve jobs")]
+        """Test 25: triple matched case-insensitively; same predicate updates
+        only confidence."""
+        original = [_make_relation("apple inc.", "founded_by", "steve jobs",
+                                   confidence=0.5)]
 
         llm_resp = RelationsResponse(relations=[
             RelationOut(subject="Apple Inc.", predicate="founded_by",
@@ -799,5 +829,7 @@ class TestCaseInsensitiveMatching:
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
 
+        # Exact triple match (case-insensitive) -> update confidence, no append
         assert len(result) == 1
         assert result[0].predicate == "founded_by"
+        assert result[0].confidence == pytest.approx(0.97)
