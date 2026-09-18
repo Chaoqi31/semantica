@@ -740,7 +740,7 @@ class OpenAIProvider(BaseProvider):
         response = self.client.chat.completions.create(**create_kwargs)
         return response.choices[0].message.content
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured JSON output."""
         if not self.client:
             raise ProcessingError("OpenAI client not initialized.")
@@ -894,7 +894,7 @@ class GeminiProvider(BaseProvider):
             )
             return self._resp_text(response)
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured output."""
         if not self.client:
             raise ProcessingError("Gemini client not initialized.")
@@ -1021,7 +1021,7 @@ class GroqProvider(BaseProvider):
         response = self.client.chat.completions.create(**create_kwargs)
         return response.choices[0].message.content
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured output."""
         if not self.client:
             raise ProcessingError("Groq client not initialized.")
@@ -1125,7 +1125,7 @@ class AnthropicProvider(BaseProvider):
         response = self.client.messages.create(**create_kwargs)
         return response.content[0].text
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured output."""
         if not self.client:
             raise ProcessingError("Anthropic client not initialized.")
@@ -1228,7 +1228,7 @@ class OllamaProvider(BaseProvider):
         )
         return response.get("response", "")
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured output."""
         if not self.client:
             raise ProcessingError("Ollama client not initialized.")
@@ -1491,14 +1491,24 @@ class HuggingFaceLLMProvider(BaseProvider):
         # Remove the original prompt from the response
         return generated_text[len(prompt) :].strip()
 
-    def generate_structured(self, prompt: str, **kwargs) -> dict:
+    def generate_structured(self, prompt: str, **kwargs) -> Union[dict, list]:
         """Generate structured output."""
         response = self.generate(prompt, **kwargs)
         try:
             return json.loads(response)
         except json.JSONDecodeError:
-            start = response.find("{")
-            end = response.rfind("}") + 1
+            # Find the outermost JSON object or array boundary, whichever comes first.
+            start_obj = response.find("{")
+            start_lst = response.find("[")
+            if start_obj < 0:
+                start = start_lst
+            elif start_lst < 0:
+                start = start_obj
+            else:
+                start = min(start_obj, start_lst)
+            end_obj = response.rfind("}")
+            end_lst = response.rfind("]")
+            end = max(end_obj, end_lst) + 1
             if start >= 0 and end > start:
                 return json.loads(response[start:end])
             raise ProcessingError("Failed to parse JSON from HuggingFace response")

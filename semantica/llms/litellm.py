@@ -182,9 +182,15 @@ class LiteLLM:
             try:
                 return json.loads(text_response)
             except json.JSONDecodeError:
-                # Try to extract JSON from text
+                # Try to extract the outermost JSON object or array from prose.
                 import re
-                json_match = re.search(r'\{.*\}', text_response, re.DOTALL)
+                obj_match = re.search(r'\{.*\}', text_response, re.DOTALL)
+                arr_match = re.search(r'\[.*\]', text_response, re.DOTALL)
+                # Prefer whichever boundary starts earliest in the text.
+                if obj_match and arr_match:
+                    json_match = obj_match if obj_match.start() <= arr_match.start() else arr_match
+                else:
+                    json_match = obj_match or arr_match
                 if json_match:
                     return json.loads(json_match.group())
                 raise ProcessingError(f"Failed to parse JSON from LiteLLM response: {text_response[:200]}")
