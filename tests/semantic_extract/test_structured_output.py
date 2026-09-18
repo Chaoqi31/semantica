@@ -1,7 +1,7 @@
 
 import pytest
 from unittest.mock import MagicMock, patch
-from typing import List, Optional, Type, Union
+from typing import List, Type, Union
 from pydantic import BaseModel, ValidationError
 
 from semantica.semantic_extract.providers import BaseProvider

@@ -90,6 +90,60 @@ from .config import config
 from .registry import provider_registry
 
 
+def _extract_first_json_value(text: str):
+    """Scan *text* for the first top-level JSON value (object or array) and
+    return the parsed Python object, or ``None`` if no valid JSON is found.
+
+    Unlike simple ``find``/``rfind`` this walks forward character-by-character
+    so it correctly handles:
+    * Nested objects and arrays (``{"a": [1, 2]}``).
+    * String literals containing brackets (``{"k": "[not a list]"}``).
+    * Misleading prose brackets before the actual JSON
+      (``"Intro [not JSON] then {"ok": 1}"``).
+
+    If a candidate starting position produces invalid JSON we advance past it
+    and keep looking rather than raising immediately.
+    """
+    OPEN = {"{": "}", "[": "]"}
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch not in OPEN:
+            i += 1
+            continue
+        close = OPEN[ch]
+        depth = 0
+        in_string = False
+        escape_next = False
+        j = i
+        while j < n:
+            c = text[j]
+            if escape_next:
+                escape_next = False
+            elif in_string:
+                if c == "\\":
+                    escape_next = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c == ch:
+                    depth += 1
+                elif c == close:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i : j + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+            j += 1
+        i += 1
+    return None
+
+
 class BaseProvider:
     """Base class for providers - makes it easy to add custom providers."""
 
@@ -147,7 +201,16 @@ class BaseProvider:
         try:
             return json.loads(cleaned_text)
         except json.JSONDecodeError:
-            # Try to find JSON boundaries (outermost { } or [ ])
+            # First, try the scan-based extractor: it correctly handles
+            # misleading prose brackets and nested structures by tracking
+            # depth and string literals rather than using find/rfind.
+            extracted = _extract_first_json_value(cleaned_text)
+            if extracted is not None:
+                return extracted
+
+            # Fall back to the original find/rfind approach which also
+            # attempts structural repair (close unclosed braces, fix trailing
+            # commas) for truncated or otherwise malformed responses.
             start_obj = cleaned_text.find("{")
             start_list = cleaned_text.find("[")
 
@@ -1495,22 +1558,8 @@ class HuggingFaceLLMProvider(BaseProvider):
         """Generate structured output."""
         response = self.generate(prompt, **kwargs)
         try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # Find the outermost JSON object or array boundary, whichever comes first.
-            start_obj = response.find("{")
-            start_lst = response.find("[")
-            if start_obj < 0:
-                start = start_lst
-            elif start_lst < 0:
-                start = start_obj
-            else:
-                start = min(start_obj, start_lst)
-            end_obj = response.rfind("}")
-            end_lst = response.rfind("]")
-            end = max(end_obj, end_lst) + 1
-            if start >= 0 and end > start:
-                return json.loads(response[start:end])
+            return self._parse_json(response)
+        except ProcessingError:
             raise ProcessingError("Failed to parse JSON from HuggingFace response")
 
 

@@ -248,3 +248,60 @@ def test_generate_structured_prefers_earlier_json_boundary(litellm_available, mo
 
     assert result == [{"x": 1}]
     assert isinstance(result, list)
+
+
+# --- Qodo finding #1 regression: misleading brackets before valid JSON ------
+
+
+def _make_litellm_with_response(monkeypatch, content: str) -> "LiteLLM":
+    """Return a LiteLLM instance whose completion call returns *content*."""
+    import semantica.llms.litellm as _mod
+
+    fake_message = MagicMock()
+    fake_message.content = content
+    fake_choice = MagicMock()
+    fake_choice.message = fake_message
+    fake_response = MagicMock()
+    fake_response.choices = [fake_choice]
+    monkeypatch.setattr(_mod, "completion", lambda **kw: fake_response)
+    return LiteLLM(model="openai/gpt-4o", api_key="k")
+
+
+def test_generate_structured_misleading_array_before_object(litellm_available, monkeypatch):
+    """Regression for Qodo finding #1: prose containing [not JSON] before a
+    valid JSON object must return the object, not raise ProcessingError."""
+    llm = _make_litellm_with_response(
+        monkeypatch, 'Intro [not JSON] then {"ok": 1}'
+    )
+    result = llm.generate_structured("test")
+    assert result == {"ok": 1}
+    assert isinstance(result, dict)
+
+
+def test_generate_structured_misleading_object_before_array(litellm_available, monkeypatch):
+    """Misleading {...} prose (not valid JSON) before a valid JSON array must
+    return the array."""
+    llm = _make_litellm_with_response(
+        monkeypatch, "note {broken then [1, 2, 3]"
+    )
+    result = llm.generate_structured("test")
+    assert result == [1, 2, 3]
+    assert isinstance(result, list)
+
+
+def test_generate_structured_nested_json_object(litellm_available, monkeypatch):
+    """Nested objects must not confuse the bracket scanner."""
+    llm = _make_litellm_with_response(
+        monkeypatch, 'Result: {"a": {"b": [1, 2]}, "c": 3}'
+    )
+    result = llm.generate_structured("test")
+    assert result == {"a": {"b": [1, 2]}, "c": 3}
+
+
+def test_generate_structured_bracket_in_string_value(litellm_available, monkeypatch):
+    """A closing bracket inside a string literal must not end the JSON early."""
+    llm = _make_litellm_with_response(
+        monkeypatch, '{"msg": "array: [1,2]", "val": 42}'
+    )
+    result = llm.generate_structured("test")
+    assert result == {"msg": "array: [1,2]", "val": 42}

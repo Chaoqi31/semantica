@@ -10,7 +10,7 @@ are at the core of issue #1270:
    JSON array from the model's raw text output via the fallback boundary search.
 """
 
-import json
+import logging
 
 import pytest
 
@@ -90,7 +90,6 @@ def _make_hf_provider(response_text: str) -> HuggingFaceLLMProvider:
     provider.device = "cpu"
     provider.config = {}
 
-    import logging
     provider.logger = logging.getLogger("test_hf_provider")
 
     # Patch generate() to return fixed text without touching any model.
@@ -126,3 +125,44 @@ def test_hf_generate_structured_raises_when_no_json():
     provider = _make_hf_provider("no json here")
     with pytest.raises(ProcessingError, match="Failed to parse JSON from HuggingFace response"):
         provider.generate_structured("prompt")
+
+
+
+# ---------------------------------------------------------------------------
+# Qodo finding #2 regression: misleading brackets before valid JSON
+# These would have produced wrong results or raised ProcessingError with the
+# old hand-rolled rfind-based fallback; they must pass with the fixed code.
+# ---------------------------------------------------------------------------
+
+def test_hf_generate_structured_misleading_array_before_object():
+    """Regression for Qodo finding #2: prose containing [not JSON] before a
+    valid JSON object must return the object, not raise ProcessingError."""
+    provider = _make_hf_provider('Intro [not JSON] then {"ok": 1}')
+    result = provider.generate_structured("prompt")
+    assert result == {"ok": 1}
+    assert isinstance(result, dict)
+
+
+def test_hf_generate_structured_nested_object():
+    """Nested objects must not confuse the shared _parse_json helper."""
+    provider = _make_hf_provider('{"a": {"b": [1, 2]}, "c": 3}')
+    result = provider.generate_structured("prompt")
+    assert result == {"a": {"b": [1, 2]}, "c": 3}
+    assert isinstance(result, dict)
+
+
+def test_hf_generate_structured_bracket_in_string_value():
+    """A closing bracket inside a string literal must not end parsing early."""
+    provider = _make_hf_provider('{"msg": "see [1,2]", "val": 99}')
+    result = provider.generate_structured("prompt")
+    assert result == {"msg": "see [1,2]", "val": 99}
+    assert isinstance(result, dict)
+
+
+def test_parse_json_misleading_array_before_object():
+    """BaseProvider._parse_json regression: prose with [not JSON] before a
+    valid JSON object must return the object."""
+    p = _ConcreteProvider()
+    result = p._parse_json('Intro [not JSON] then {"ok": 1}')
+    assert result == {"ok": 1}
+    assert isinstance(result, dict)
