@@ -733,6 +733,54 @@ class TestNewRelationEndpointResolution:
         assert new_rel.subject.metadata.get("synthetic") is True
         assert new_rel.object.label == "ORG"
 
+    def test_synthetic_endpoint_span_located_in_source_text(self):
+        """Finding #2: A synthetic endpoint that appears in the source text must
+        receive its actual character span, not a fabricated (0, len(name)) value."""
+        source = "The Board met. Tim Cook announced that Apple would expand."
+        # Only Apple is in the original relation pool
+        apple = Entity(text="Apple", label="ORG", start_char=40, end_char=45,
+                       confidence=0.9, metadata={})
+        original = [
+            Relation(
+                subject=apple,
+                predicate="will_expand",
+                object=_make_entity("market", "CONCEPT"),
+                confidence=0.8, context="", metadata={},
+            )
+        ]
+        llm_resp = RelationsResponse(relations=[
+            # Tim Cook is NOT in the original entity pool → synthetic
+            RelationOut(subject="Tim Cook", predicate="leads",
+                        object="Apple", confidence=0.95),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_relations(source, original)
+
+        new_rel = next(r for r in result if r.predicate == "leads")
+        expected_start = source.find("Tim Cook")
+        assert new_rel.subject.start_char == expected_start, (
+            "Synthetic endpoint must be located at its actual position in source text"
+        )
+        assert new_rel.subject.end_char == expected_start + len("Tim Cook")
+
+    def test_synthetic_endpoint_absent_from_text_gets_zero_span(self):
+        """Finding #2: A synthetic endpoint that genuinely does not appear in the
+        source text must receive the (0, 0) sentinel, not a fabricated span."""
+        source = "Apple was founded in 1976."
+        original = [_make_relation("Apple", "founded_in", "1976")]
+        llm_resp = RelationsResponse(relations=[
+            RelationOut(subject="Nonexistent Entity XYZ", predicate="partner_of",
+                        object="Apple", confidence=0.7),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_relations(source, original)
+
+        new_rel = next(r for r in result if r.predicate == "partner_of")
+        assert new_rel.subject.start_char == 0
+        assert new_rel.subject.end_char == 0, (
+            "Endpoint absent from source text must receive (0, 0) sentinel span"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Temperature propagation (Finding 6)

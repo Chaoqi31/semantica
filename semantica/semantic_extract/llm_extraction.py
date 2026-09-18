@@ -553,8 +553,11 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
         * **Truly new pair** — ``(subject, object)`` not present anywhere in
           the original list: appended as a new relation.  Subject/object
           entities are resolved against the canonical entity pool; unresolved
-          endpoints become synthetic UNKNOWN entities (consistent with
-          :func:`~.methods._parse_relation_result`).
+          endpoints have their span located in *text* with a word-boundary
+          search (same as the entity enhancer).  The span is ``(0, 0)`` when
+          the endpoint text is not present in the document — the project-wide
+          "unknown span" sentinel.  Endpoints that resolve via the pool keep
+          their canonical span unchanged.
         * Original relations absent from the LLM response are **preserved**.
         * All returned relations carry ``enhanced_by`` / ``model`` metadata.
         * Empty/unusable responses return the original list unchanged.
@@ -621,6 +624,14 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
 
         seen_new: set = set()  # guard against duplicate new triples
 
+        # Track spans already used by pool entities so synthetic endpoint
+        # span-recovery never collides with a known entity position.
+        occupied_endpoint_spans: set = {
+            (e.start_char, e.end_char)
+            for e in entity_pool
+            if e.start_char != 0 or e.end_char != 0
+        }
+
         for r_out in llm_relations:
             subj_text = (r_out.subject or "").strip()
             obj_text = (r_out.object or "").strip()
@@ -652,20 +663,42 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                     # Resolve endpoints against the canonical entity pool
                     subj_entity = next(
                         (e for e in entity_pool if e.text.lower() == subj_text.lower()),
-                        Entity(
-                            text=subj_text, label="UNKNOWN",
-                            start_char=0, end_char=len(subj_text),
-                            confidence=0.8, metadata={"synthetic": True},
-                        ),
+                        None,
                     )
                     obj_entity = next(
                         (e for e in entity_pool if e.text.lower() == obj_text.lower()),
-                        Entity(
-                            text=obj_text, label="UNKNOWN",
-                            start_char=0, end_char=len(obj_text),
-                            confidence=0.8, metadata={"synthetic": True},
-                        ),
+                        None,
                     )
+
+                    # For endpoints not found in the pool, attempt to locate them
+                    # in the source text using the same word-boundary search
+                    # already applied to new entities.  This avoids fabricating a
+                    # span at position 0 when the endpoint occurs later in the
+                    # document.  Only synthetic (unresolved) endpoints need this;
+                    # pool-resolved endpoints already carry correct spans.
+                    if subj_entity is None:
+                        s_start, s_end = _find_span_in_text(
+                            subj_text, text, occupied_endpoint_spans
+                        )
+                        if s_start != 0 or s_end != 0:
+                            occupied_endpoint_spans.add((s_start, s_end))
+                        subj_entity = Entity(
+                            text=subj_text, label="UNKNOWN",
+                            start_char=s_start, end_char=s_end,
+                            confidence=0.8, metadata={"synthetic": True},
+                        )
+
+                    if obj_entity is None:
+                        o_start, o_end = _find_span_in_text(
+                            obj_text, text, occupied_endpoint_spans
+                        )
+                        if o_start != 0 or o_end != 0:
+                            occupied_endpoint_spans.add((o_start, o_end))
+                        obj_entity = Entity(
+                            text=obj_text, label="UNKNOWN",
+                            start_char=o_start, end_char=o_end,
+                            confidence=0.8, metadata={"synthetic": True},
+                        )
 
                     working.append(Relation(
                         subject=subj_entity,
