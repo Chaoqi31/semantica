@@ -2,34 +2,46 @@
 
 These tests would ALL FAIL against the old stub implementation because
 _parse_entity_response / _parse_relation_response used to ignore the
-LLM response entirely. They pass after the fix.
+LLM response entirely.  They pass after the fix.
 
-Coverage:
-  Entity enhancement
-    1. LLM updates an existing entity's label
-    2. LLM updates an existing entity's confidence
-    3. LLM adds a brand-new entity not in the original list
-    4. Empty LLM response preserves originals without data loss
-    5. Malformed/unusable LLM response falls back gracefully
-    6. enhanced_by / model metadata is always present
-    7. Entities not mentioned by the LLM are preserved unchanged
+Coverage
+--------
+Entity enhancement
+  1.  LLM updates an existing entity's label
+  2.  LLM updates an existing entity's confidence
+  3.  LLM adds a brand-new entity; span is located in source text
+  4.  LLM adds a new entity absent from the source text → span (0, 0)
+  5.  Empty LLM response preserves originals without data loss
+  6.  Provider failure falls back gracefully
+  7.  enhanced_by / model metadata always present (updated, new, untouched)
+  8.  Entities not mentioned by the LLM are preserved unchanged
+  9.  Repeated mentions at different offsets are ALL updated
+  10. No duplicate entities when LLM repeats the same text
 
-  Relation enhancement
-    8.  LLM updates an existing relation's predicate
-    9.  LLM updates an existing relation's confidence
-    10. LLM adds a brand-new relation not in the original list
-    11. Empty LLM response preserves originals without data loss
-    12. Malformed/unusable LLM response falls back gracefully
-    13. enhanced_by / model metadata is always present on relations
-    14. Relations not mentioned by the LLM are preserved unchanged
+Relation enhancement
+  11. LLM corrects an existing relation's predicate (subject+object identity)
+  12. LLM updates an existing relation's confidence
+  13. LLM adds a new relation
+  14. Empty LLM response preserves originals
+  15. Provider failure falls back gracefully
+  16. enhanced_by / model metadata always present (updated, new, untouched)
+  17. Relations not mentioned by the LLM are preserved unchanged
+  18. No duplicate relations when LLM repeats the same pair
+  19. Multiple relations with same endpoints but different predicates are ALL updated
+  20. New relation endpoint resolves to canonical entity from pool
+  21. Unresolvable endpoint becomes synthetic UNKNOWN
 
-  Integration helpers (_parse_entity_response / _parse_relation_response)
-    15. No duplicate entities when LLM repeats an existing entity
-    16. No duplicate relations when LLM repeats an existing pair
+Temperature propagation
+  22. temperature=None is forwarded as-is to generate_typed
+  23. Explicit temperature is forwarded correctly
+
+Case-insensitive matching
+  24. Entity text match is case-insensitive
+  25. Relation subject/object match is case-insensitive
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from semantica.semantic_extract.llm_extraction import LLMExtraction
 from semantica.semantic_extract.schemas import EntitiesResponse, EntityOut, RelationsResponse, RelationOut
@@ -40,19 +52,19 @@ from semantica.semantic_extract.types import Entity, Relation
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_entity(text: str, label: str, confidence: float = 0.8) -> Entity:
+def _make_entity(text: str, label: str, confidence: float = 0.8,
+                 start: int = 0, end: int = 0) -> Entity:
+    end = end or len(text)
     return Entity(
-        text=text,
-        label=label,
-        start_char=0,
-        end_char=len(text),
-        confidence=confidence,
-        metadata={},
+        text=text, label=label,
+        start_char=start, end_char=end,
+        confidence=confidence, metadata={},
     )
 
 
 def _make_relation(
-    subj_text: str, pred: str, obj_text: str, confidence: float = 0.8
+    subj_text: str, pred: str, obj_text: str,
+    confidence: float = 0.8,
 ) -> Relation:
     return Relation(
         subject=_make_entity(subj_text, "ORG"),
@@ -64,13 +76,13 @@ def _make_relation(
     )
 
 
-def _make_extractor(llm_response) -> LLMExtraction:
+def _make_extractor(llm_response, *, temperature=None) -> LLMExtraction:
     """Return an LLMExtraction instance whose provider.generate_typed returns
     *llm_response* without hitting any real API."""
     extractor = LLMExtraction.__new__(LLMExtraction)
     extractor.provider_name = "openai"
     extractor.model = "gpt-4"
-    extractor.temperature = None
+    extractor.temperature = temperature
     extractor.config = {}
 
     from semantica.utils.logging import get_logger
@@ -88,25 +100,43 @@ def _make_extractor(llm_response) -> LLMExtraction:
     return extractor
 
 
+def _make_failing_extractor() -> LLMExtraction:
+    extractor = LLMExtraction.__new__(LLMExtraction)
+    extractor.provider_name = "openai"
+    extractor.model = "gpt-4"
+    extractor.temperature = None
+    extractor.config = {}
+
+    from semantica.utils.logging import get_logger
+    extractor.logger = get_logger("test_llm_enhancement")
+    from semantica.utils.progress_tracker import get_progress_tracker
+    extractor.progress_tracker = get_progress_tracker()
+    extractor.progress_tracker.enabled = False
+
+    mock_provider = MagicMock()
+    mock_provider.is_available.return_value = True
+    mock_provider.generate_typed.side_effect = Exception("simulated failure")
+    extractor.provider = mock_provider
+    return extractor
+
+
 # ---------------------------------------------------------------------------
-# Entity enhancement tests
+# Entity enhancement — label and confidence updates
 # ---------------------------------------------------------------------------
 
 class TestEnhanceEntitiesLabelUpdate:
     """Test 1 – LLM corrects an existing entity's label."""
 
     def test_label_is_updated(self):
-        original = [_make_entity("Apple Inc.", "PRODUCT")]  # wrong label
+        original = [_make_entity("Apple Inc.", "PRODUCT")]
 
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_entities("Apple Inc. is a company.", original)
 
         assert len(result) == 1
-        assert result[0].text == "Apple Inc."
         assert result[0].label == "ORG", "LLM-corrected label must be applied"
 
 
@@ -120,45 +150,86 @@ class TestEnhanceEntitiesConfidenceUpdate:
             EntityOut(text="Steve Jobs", label="PERSON", confidence=0.99),
         ])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_entities("Steve Jobs founded Apple.", original)
 
         assert result[0].confidence == pytest.approx(0.99)
 
 
-class TestEnhanceEntitiesNewEntity:
-    """Test 3 – LLM adds a new entity absent from the original list."""
+# ---------------------------------------------------------------------------
+# Entity enhancement — new entity span recovery
+# ---------------------------------------------------------------------------
 
-    def test_new_entity_appended(self):
-        original = [_make_entity("Apple Inc.", "ORG")]
+class TestEnhanceEntitiesNewEntitySpan:
+    """Tests 3–4 — new entities get a located span when the text allows it."""
+
+    def test_new_entity_span_located_in_text(self):
+        """Test 3: new entity present in source text receives correct span."""
+        source = "Apple Inc. was founded by Steve Jobs in 1976."
+        original = [_make_entity("Apple Inc.", "ORG", start=0, end=10)]
 
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
             EntityOut(text="Steve Jobs", label="PERSON", confidence=0.95),  # new
         ])
         extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities(source, original)
 
-        result = extractor.enhance_entities(
-            "Apple Inc. was founded by Steve Jobs.", original
+        new_ent = next(e for e in result if e.text == "Steve Jobs")
+        expected_start = source.find("Steve Jobs")
+        assert new_ent.start_char == expected_start, (
+            "New entity must be located at its actual position in the source text"
+        )
+        assert new_ent.end_char == expected_start + len("Steve Jobs")
+
+    def test_new_entity_absent_from_text_gets_zero_span(self):
+        """Test 4: new entity NOT in source text gets (0, 0) sentinel."""
+        source = "Apple Inc. is a technology company."
+        original = [_make_entity("Apple Inc.", "ORG", start=0, end=10)]
+
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Completely Absent Corp", label="ORG", confidence=0.7),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities(source, original)
+
+        absent = next(e for e in result if e.text == "Completely Absent Corp")
+        assert absent.start_char == 0
+        assert absent.end_char == 0, (
+            "Entity not present in source text must get (0, 0) sentinel span"
         )
 
-        texts = [e.text for e in result]
-        assert "Steve Jobs" in texts, "New entity from LLM must be appended"
-        assert len(result) == 2
+    def test_new_entity_later_in_text_gets_correct_span(self):
+        """New entity that occurs later in the document (not at position 0)
+        must receive the correct offset, not (0, 0)."""
+        source = "The Board of Directors announced that Tim Cook will lead Apple."
+        original = [_make_entity("Apple", "ORG", start=source.find("Apple"), end=source.find("Apple") + 5)]
 
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Tim Cook", label="PERSON", confidence=0.95),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities(source, original)
+
+        tim = next(e for e in result if e.text == "Tim Cook")
+        expected = source.find("Tim Cook")
+        assert tim.start_char == expected
+        assert tim.end_char == expected + len("Tim Cook")
+
+
+# ---------------------------------------------------------------------------
+# Entity enhancement — empty response, fallback, metadata
+# ---------------------------------------------------------------------------
 
 class TestEnhanceEntitiesEmptyResponse:
-    """Test 4 – Empty LLM response preserves the original list."""
+    """Test 5 – Empty LLM response preserves the original list."""
 
     def test_empty_response_preserves_originals(self):
         original = [
             _make_entity("Apple Inc.", "ORG"),
             _make_entity("Tim Cook", "PERSON"),
         ]
-
-        llm_resp = EntitiesResponse(entities=[])  # LLM returned nothing
+        llm_resp = EntitiesResponse(entities=[])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_entities("Apple Inc.", original)
 
         assert len(result) == 2
@@ -168,28 +239,11 @@ class TestEnhanceEntitiesEmptyResponse:
 
 
 class TestEnhanceEntitiesMalformedResponse:
-    """Test 5 – Provider raises; method falls back to original entities."""
+    """Test 6 – Provider raises; method falls back to original entities."""
 
     def test_fallback_on_provider_error(self):
         original = [_make_entity("Apple Inc.", "ORG")]
-
-        extractor = LLMExtraction.__new__(LLMExtraction)
-        extractor.provider_name = "openai"
-        extractor.model = "gpt-4"
-        extractor.temperature = None
-        extractor.config = {}
-
-        from semantica.utils.logging import get_logger
-        extractor.logger = get_logger("test_llm_enhancement")
-        from semantica.utils.progress_tracker import get_progress_tracker
-        extractor.progress_tracker = get_progress_tracker()
-        extractor.progress_tracker.enabled = False
-
-        mock_provider = MagicMock()
-        mock_provider.is_available.return_value = True
-        mock_provider.generate_typed.side_effect = Exception("network timeout")
-        extractor.provider = mock_provider
-
+        extractor = _make_failing_extractor()
         result = extractor.enhance_entities("Apple Inc. is a company.", original)
 
         assert len(result) == 1
@@ -197,11 +251,10 @@ class TestEnhanceEntitiesMalformedResponse:
 
 
 class TestEnhanceEntitiesMetadata:
-    """Test 6 – enhanced_by and model metadata always present."""
+    """Test 7 – enhanced_by and model metadata always present."""
 
     def test_metadata_present_on_updated_entity(self):
         original = [_make_entity("Apple Inc.", "PRODUCT")]
-
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
         ])
@@ -213,25 +266,22 @@ class TestEnhanceEntitiesMetadata:
 
     def test_metadata_present_on_new_entity(self):
         original = [_make_entity("Apple Inc.", "ORG")]
-
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
             EntityOut(text="Steve Jobs", label="PERSON", confidence=0.95),
         ])
         extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_entities("text", original)
+        result = extractor.enhance_entities("Apple Inc. was founded by Steve Jobs.", original)
 
         new_ent = next(e for e in result if e.text == "Steve Jobs")
         assert new_ent.metadata.get("enhanced_by") == "openai"
         assert new_ent.metadata.get("model") == "gpt-4"
 
     def test_metadata_present_on_untouched_entity(self):
-        """Entities NOT returned by the LLM must still get the metadata stamp."""
         original = [
             _make_entity("Apple Inc.", "ORG"),
             _make_entity("Tim Cook", "PERSON"),
         ]
-        # LLM only mentions Apple, not Tim Cook
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.98),
         ])
@@ -243,14 +293,13 @@ class TestEnhanceEntitiesMetadata:
 
 
 class TestEnhanceEntitiesPreservesUntouched:
-    """Test 7 – Entities not referenced by the LLM are preserved unchanged."""
+    """Test 8 – Entities not referenced by the LLM are preserved unchanged."""
 
     def test_untouched_entity_preserved(self):
         original = [
             _make_entity("Apple Inc.", "ORG", confidence=0.9),
             _make_entity("Cupertino", "GPE", confidence=0.85),
         ]
-        # LLM only mentions Apple
         llm_resp = EntitiesResponse(entities=[
             EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
         ])
@@ -263,44 +312,117 @@ class TestEnhanceEntitiesPreservesUntouched:
 
 
 # ---------------------------------------------------------------------------
-# Relation enhancement tests
+# Entity enhancement — repeated mentions
+# ---------------------------------------------------------------------------
+
+class TestEnhanceEntitiesRepeatedMentions:
+    """Test 9 – Same entity text at different offsets are ALL updated."""
+
+    def test_all_occurrences_updated(self):
+        """Apple appears twice at different offsets; both must get the updated label."""
+        source = "Apple is large. Apple is also profitable."
+        original = [
+            _make_entity("Apple", "PRODUCT", start=0, end=5),
+            _make_entity("Apple", "PRODUCT", start=16, end=21),
+        ]
+
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities(source, original)
+
+        assert len(result) == 2
+        for ent in result:
+            assert ent.label == "ORG", (
+                "All occurrences of the entity text must receive the updated label"
+            )
+
+    def test_offsets_of_repeated_mentions_preserved(self):
+        """Original character positions must be preserved after an update."""
+        source = "Apple is large. Apple is also profitable."
+        original = [
+            _make_entity("Apple", "PRODUCT", start=0, end=5),
+            _make_entity("Apple", "PRODUCT", start=16, end=21),
+        ]
+
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities(source, original)
+
+        spans = sorted((e.start_char, e.end_char) for e in result)
+        assert spans == [(0, 5), (16, 21)], (
+            "Character offsets must be preserved during an update"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entity enhancement — deduplication
+# ---------------------------------------------------------------------------
+
+class TestNoDuplicateEntities:
+    """Test 10 – LLM repeating an entity does not duplicate it."""
+
+    def test_no_duplicate_on_repeated_existing_entity(self):
+        original = [_make_entity("Apple Inc.", "ORG")]
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.95),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities("text", original)
+
+        apple_count = sum(1 for e in result if e.text == "Apple Inc.")
+        assert apple_count == 1
+
+    def test_no_duplicate_new_entity_mentioned_twice(self):
+        original = [_make_entity("Apple Inc.", "ORG")]
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Steve Jobs", label="PERSON", confidence=0.95),
+            EntityOut(text="Steve Jobs", label="PERSON", confidence=0.93),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities("Steve Jobs founded Apple Inc.", original)
+
+        jobs_count = sum(1 for e in result if e.text == "Steve Jobs")
+        assert jobs_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Relation enhancement — predicate correction (subject+object identity)
 # ---------------------------------------------------------------------------
 
 class TestEnhanceRelationsPredicateUpdate:
-    """Test 8 – LLM corrects an existing relation's predicate.
+    """Test 11 – LLM corrects an existing relation's predicate via (subj, obj) matching."""
 
-    Because the relation identity includes the predicate, a correction appears
-    as a *new* relation with the corrected predicate (the old one is preserved).
-    If the caller's intent is to replace a generic "related_to" with a specific
-    type, both the original and the corrected relation will be present in the
-    result.  This is the correct graph-semantics behaviour: the LLM is additive,
-    not destructive.
-    """
-
-    def test_new_predicate_appended_old_preserved(self):
+    def test_predicate_is_updated(self):
+        """The enhancement contract: matching on (subject, object) allows the LLM
+        to correct a generic predicate to a specific one."""
         original = [_make_relation("Apple Inc.", "related_to", "Steve Jobs")]
 
         llm_resp = RelationsResponse(relations=[
-            # LLM returns a more specific predicate for the same pair
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_relations(
             "Apple Inc. was founded by Steve Jobs.", original
         )
 
-        # The original "related_to" is preserved; "founded_by" is added
-        predicates = {r.predicate for r in result}
-        assert "founded_by" in predicates, "LLM-suggested predicate must be added"
-        assert "related_to" in predicates, "Original predicate must be preserved"
+        assert len(result) == 1
+        assert result[0].predicate == "founded_by", (
+            "LLM-suggested predicate must replace the original one"
+        )
 
-    def test_exact_triple_match_updates_confidence(self):
-        """If the LLM returns the exact same triple it matched, only confidence changes."""
+    def test_exact_match_updates_confidence(self):
+        """When the LLM returns the same predicate as already present, only confidence changes."""
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.5)]
 
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.99),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.99),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -311,83 +433,68 @@ class TestEnhanceRelationsPredicateUpdate:
 
 
 class TestEnhanceRelationsConfidenceUpdate:
-    """Test 9 – LLM updates an existing relation's confidence."""
+    """Test 12 – LLM updates an existing relation's confidence."""
 
     def test_confidence_is_updated(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.5)]
 
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.99),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.99),
         ])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_relations("text", original)
 
         assert result[0].confidence == pytest.approx(0.99)
 
 
+# ---------------------------------------------------------------------------
+# Relation enhancement — new relation, empty, fallback, metadata
+# ---------------------------------------------------------------------------
+
 class TestEnhanceRelationsNewRelation:
-    """Test 10 – LLM adds a new relation absent from the original list."""
+    """Test 13 – LLM adds a new relation absent from the original list."""
 
     def test_new_relation_appended(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
 
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
-            # New relation: Apple Inc. located_in Cupertino
-            RelationOut(subject="Apple Inc.", predicate="located_in", object="Cupertino", confidence=0.95),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="located_in",
+                        object="Cupertino", confidence=0.95),
         ])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_relations(
             "Apple Inc. is located in Cupertino.", original
         )
 
         predicates = [r.predicate for r in result]
-        assert "located_in" in predicates, "New relation from LLM must be appended"
+        assert "located_in" in predicates
         assert len(result) == 2
 
 
 class TestEnhanceRelationsEmptyResponse:
-    """Test 11 – Empty LLM response preserves the original relations."""
+    """Test 14 – Empty LLM response preserves the original relations."""
 
     def test_empty_response_preserves_originals(self):
         original = [
             _make_relation("Apple Inc.", "founded_by", "Steve Jobs"),
             _make_relation("Steve Jobs", "ceo_of", "Apple Inc."),
         ]
-
         llm_resp = RelationsResponse(relations=[])
         extractor = _make_extractor(llm_resp)
-
         result = extractor.enhance_relations("text", original)
 
         assert len(result) == 2
 
 
 class TestEnhanceRelationsMalformedResponse:
-    """Test 12 – Provider raises; method falls back to original relations."""
+    """Test 15 – Provider raises; method falls back to original relations."""
 
     def test_fallback_on_provider_error(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
-
-        extractor = LLMExtraction.__new__(LLMExtraction)
-        extractor.provider_name = "openai"
-        extractor.model = "gpt-4"
-        extractor.temperature = None
-        extractor.config = {}
-
-        from semantica.utils.logging import get_logger
-        extractor.logger = get_logger("test_llm_enhancement")
-        from semantica.utils.progress_tracker import get_progress_tracker
-        extractor.progress_tracker = get_progress_tracker()
-        extractor.progress_tracker.enabled = False
-
-        mock_provider = MagicMock()
-        mock_provider.is_available.return_value = True
-        mock_provider.generate_typed.side_effect = RuntimeError("api down")
-        extractor.provider = mock_provider
-
+        extractor = _make_failing_extractor()
         result = extractor.enhance_relations("text", original)
 
         assert len(result) == 1
@@ -395,13 +502,13 @@ class TestEnhanceRelationsMalformedResponse:
 
 
 class TestEnhanceRelationsMetadata:
-    """Test 13 – enhanced_by and model metadata always present on relations."""
+    """Test 16 – enhanced_by and model metadata always present on relations."""
 
     def test_metadata_present_on_updated_relation(self):
         original = [_make_relation("Apple Inc.", "related_to", "Steve Jobs")]
-
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -411,10 +518,11 @@ class TestEnhanceRelationsMetadata:
 
     def test_metadata_present_on_new_relation(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
-
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
-            RelationOut(subject="Apple Inc.", predicate="located_in", object="Cupertino", confidence=0.9),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="located_in",
+                        object="Cupertino", confidence=0.9),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -424,14 +532,13 @@ class TestEnhanceRelationsMetadata:
         assert new_rel.metadata.get("model") == "gpt-4"
 
     def test_metadata_present_on_untouched_relation(self):
-        """Relations not returned by the LLM must still get the metadata stamp."""
         original = [
             _make_relation("Apple Inc.", "founded_by", "Steve Jobs"),
             _make_relation("Steve Jobs", "ceo_of", "Apple Inc."),
         ]
-        # LLM only mentions first relation
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -441,16 +548,16 @@ class TestEnhanceRelationsMetadata:
 
 
 class TestEnhanceRelationsPreservesUntouched:
-    """Test 14 – Relations not referenced by the LLM are preserved unchanged."""
+    """Test 17 – Relations not referenced by the LLM are preserved unchanged."""
 
     def test_untouched_relation_preserved(self):
         original = [
             _make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.9),
             _make_relation("Steve Jobs", "ceo_of", "Apple Inc.", confidence=0.85),
         ]
-        # LLM only mentions first relation
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -461,206 +568,103 @@ class TestEnhanceRelationsPreservesUntouched:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication tests
+# Relation enhancement — deduplication
 # ---------------------------------------------------------------------------
-
-class TestNoDuplicateEntities:
-    """Test 15 – LLM repeating an entity does not duplicate it."""
-
-    def test_no_duplicate_on_repeated_entity(self):
-        original = [_make_entity("Apple Inc.", "ORG")]
-
-        # LLM returns the same entity twice
-        llm_resp = EntitiesResponse(entities=[
-            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
-            EntityOut(text="Apple Inc.", label="ORG", confidence=0.95),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_entities("text", original)
-
-        apple_count = sum(1 for e in result if e.text == "Apple Inc.")
-        assert apple_count == 1, "Duplicate entity must not be created"
-
-    def test_no_duplicate_new_entity_mentioned_twice(self):
-        original = [_make_entity("Apple Inc.", "ORG")]
-
-        # LLM returns a new entity twice
-        llm_resp = EntitiesResponse(entities=[
-            EntityOut(text="Steve Jobs", label="PERSON", confidence=0.95),
-            EntityOut(text="Steve Jobs", label="PERSON", confidence=0.93),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_entities("text", original)
-
-        jobs_count = sum(1 for e in result if e.text == "Steve Jobs")
-        assert jobs_count == 1, "New entity mentioned twice must only be appended once"
-
 
 class TestNoDuplicateRelations:
-    """Test 16 – LLM repeating the same (subject, predicate, object) triple
-    does not produce duplicate relations."""
+    """Test 18 – LLM repeating the same (subject, object) pair does not
+    duplicate relations."""
 
-    def test_no_duplicate_on_repeated_existing_triple(self):
+    def test_no_duplicate_on_repeated_pair(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
 
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.95),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.95),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
 
-        triple_count = sum(
+        count = sum(
             1 for r in result
-            if r.subject.text == "Apple Inc."
-            and r.predicate == "founded_by"
-            and r.object.text == "Steve Jobs"
+            if r.subject.text == "Apple Inc." and r.object.text == "Steve Jobs"
         )
-        assert triple_count == 1, "Duplicate triple must not be created"
+        assert count == 1
 
-    def test_no_duplicate_new_relation_triple_mentioned_twice(self):
+    def test_no_duplicate_new_relation_mentioned_twice(self):
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
 
         llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="located_in", object="Cupertino", confidence=0.9),
-            RelationOut(subject="Apple Inc.", predicate="located_in", object="Cupertino", confidence=0.85),
+            RelationOut(subject="Apple Inc.", predicate="located_in",
+                        object="Cupertino", confidence=0.9),
+            RelationOut(subject="Apple Inc.", predicate="located_in",
+                        object="Cupertino", confidence=0.85),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
 
-        new_count = sum(1 for r in result if r.predicate == "located_in")
-        assert new_count == 1, "New triple mentioned twice must only be appended once"
+        new_count = sum(1 for r in result if r.object.text == "Cupertino")
+        assert new_count == 1
 
 
 # ---------------------------------------------------------------------------
-# Case-insensitive matching
-# ---------------------------------------------------------------------------
-
-class TestCaseInsensitiveMatching:
-    """LLM may return entity text with different casing; matching must be
-    case-insensitive so the existing entity is updated, not duplicated."""
-
-    def test_entity_match_is_case_insensitive(self):
-        original = [_make_entity("apple inc.", "PRODUCT")]
-
-        llm_resp = EntitiesResponse(entities=[
-            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_entities("text", original)
-
-        # Should update in-place, not append a second entry
-        assert len(result) == 1
-        # The working copy retains the original casing for the text field
-        assert result[0].label == "ORG"
-
-    def test_relation_match_is_case_insensitive(self):
-        """A relation whose endpoints differ only in casing from an LLM-returned
-        triple with the same predicate must be matched and its confidence updated,
-        not treated as a new relation."""
-        original = [_make_relation("apple inc.", "founded_by", "steve jobs")]
-
-        llm_resp = RelationsResponse(relations=[
-            RelationOut(subject="Apple Inc.", predicate="founded_by", object="Steve Jobs", confidence=0.97),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_relations("text", original)
-
-        # Exact triple match (case-insensitive) → update confidence only, no append
-        assert len(result) == 1
-        assert result[0].confidence == pytest.approx(0.97)
-
-
-# ---------------------------------------------------------------------------
-# Correctness review additions (from final review pass)
+# Relation enhancement — multiple predicates same endpoints (Finding 7)
 # ---------------------------------------------------------------------------
 
 class TestMultiplePredicatesSameEndpoints:
-    """Two relations with the same subject/object but different predicates are
-    both legitimate and must be preserved independently.
+    """Test 19 — Multiple relations with same endpoints but different predicates
+    are ALL corrected when the LLM returns an update for that (subj, obj) pair."""
 
-    This is the key regression for the (subj, obj) → (subj, pred, obj) identity
-    fix: a (subj, obj)-keyed lookup would merge the second relation into the
-    first instead of keeping them distinct.
-    """
-
-    def test_two_predicates_same_pair_both_preserved(self):
-        """Original list has two relations between the same pair; LLM only
-        mentions one of them. Both must survive in the result."""
+    def test_all_predicates_updated_for_same_pair(self):
+        """If the original has two relations between A and B, an LLM update for
+        the (A, B) pair applies to both."""
         original = [
-            _make_relation("Apple Inc.", "founded_by", "Steve Jobs"),
+            _make_relation("Apple Inc.", "related_to", "Steve Jobs"),
             _make_relation("Apple Inc.", "employs", "Steve Jobs"),
         ]
-        # LLM only returns one of the two relations (updating its confidence)
+        # LLM returns founded_by for the (Apple, Jobs) pair
         llm_resp = RelationsResponse(relations=[
-            RelationOut(
-                subject="Apple Inc.", predicate="founded_by",
-                object="Steve Jobs", confidence=0.99,
-            ),
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
 
-        predicates = {r.predicate for r in result}
-        assert "founded_by" in predicates
-        assert "employs" in predicates, (
-            "Second relation with different predicate must not be overwritten"
-        )
+        # Both existing relations should be updated
         assert len(result) == 2
+        for r in result:
+            assert r.predicate == "founded_by", (
+                "All relations with same endpoints should have predicate updated"
+            )
 
-    def test_llm_adds_second_predicate_between_same_pair(self):
-        """Original has one relation; LLM returns both the original and a second
-        predicate between the same pair. Both must appear in the result."""
-        original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
-
-        llm_resp = RelationsResponse(relations=[
-            RelationOut(
-                subject="Apple Inc.", predicate="founded_by",
-                object="Steve Jobs", confidence=0.99,
-            ),
-            RelationOut(
-                subject="Apple Inc.", predicate="employs",
-                object="Steve Jobs", confidence=0.85,
-            ),
-        ])
-        extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_relations("text", original)
-
-        predicates = {r.predicate for r in result}
-        assert "founded_by" in predicates
-        assert "employs" in predicates
-        assert len(result) == 2
-
-    def test_llm_relation_with_different_predicate_does_not_corrupt_original(self):
-        """An LLM relation with the same endpoints but a different predicate must
-        not modify the confidence or any field of the original relation."""
+    def test_two_original_predicates_receive_llm_predicate(self):
+        """When multiple relations share the same (subj, obj), the LLM-provided
+        predicate replaces each original predicate."""
         original = [
-            _make_relation("Apple Inc.", "founded_by", "Steve Jobs", confidence=0.9),
+            _make_relation("A", "x", "B"),
+            _make_relation("A", "y", "B"),
         ]
         llm_resp = RelationsResponse(relations=[
-            # Different predicate — this is a new relation, not an update
-            RelationOut(
-                subject="Apple Inc.", predicate="employs",
-                object="Steve Jobs", confidence=0.5,
-            ),
+            RelationOut(subject="A", predicate="z", object="B", confidence=0.9),
         ])
         extractor = _make_extractor(llm_resp)
-        result = extractor.enhance_relations("text", original)
+        result = extractor.enhance_relations("A and B", original)
 
-        # Original relation must be unmodified
-        original_rel = next(r for r in result if r.predicate == "founded_by")
-        assert original_rel.confidence == pytest.approx(0.9), (
-            "Original relation confidence must not be changed by a different-predicate LLM entry"
-        )
+        predicates = {r.predicate for r in result}
+        assert predicates == {"z"}, "Both relations must receive the corrected predicate"
 
+
+# ---------------------------------------------------------------------------
+# Relation endpoint resolution
+# ---------------------------------------------------------------------------
 
 class TestNewRelationEndpointResolution:
-    """When the LLM returns a new relation, its endpoints must resolve to the
-    canonical Entity objects already present in the entity pool (from the
-    original relations), not create inconsistent duplicate objects."""
+    """Tests 20–21 — endpoint resolution for new relations."""
 
     def test_new_relation_reuses_canonical_subject_entity(self):
-        # Set up an original relation so "Apple Inc." is in the entity pool
+        """Test 20: New relation's subject resolves to the canonical entity."""
         apple_entity = Entity(
             text="Apple Inc.", label="ORG",
             start_char=0, end_char=10,
@@ -675,36 +679,23 @@ class TestNewRelationEndpointResolution:
                 confidence=0.9, context="", metadata={},
             )
         ]
-
         llm_resp = RelationsResponse(relations=[
-            # New relation reusing "Apple Inc." as subject
-            RelationOut(
-                subject="Apple Inc.", predicate="located_in",
-                object="Cupertino", confidence=0.88,
-            ),
+            RelationOut(subject="Apple Inc.", predicate="located_in",
+                        object="Cupertino", confidence=0.88),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("Apple Inc. is in Cupertino.", original)
 
         new_rel = next(r for r in result if r.predicate == "located_in")
-        # The subject should be the canonical entity, not a fresh synthetic one
-        assert new_rel.subject.label == "ORG", (
-            "New relation's subject must resolve to the canonical entity, not UNKNOWN"
-        )
-        assert new_rel.subject.metadata.get("canonical") is True, (
-            "New relation must reuse the canonical entity object from the pool"
-        )
+        assert new_rel.subject.label == "ORG"
+        assert new_rel.subject.metadata.get("canonical") is True
 
-    def test_unresolvable_new_relation_endpoint_becomes_synthetic(self):
-        """An endpoint text that does not match anything in the entity pool
-        must produce a synthetic UNKNOWN entity, not raise."""
+    def test_unresolvable_endpoint_becomes_synthetic(self):
+        """Test 21: Unknown endpoint becomes a synthetic UNKNOWN entity."""
         original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
-
         llm_resp = RelationsResponse(relations=[
-            RelationOut(
-                subject="Completely Unknown Corp", predicate="partner_of",
-                object="Apple Inc.", confidence=0.7,
-            ),
+            RelationOut(subject="Completely Unknown Corp", predicate="partner_of",
+                        object="Apple Inc.", confidence=0.7),
         ])
         extractor = _make_extractor(llm_resp)
         result = extractor.enhance_relations("text", original)
@@ -712,5 +703,101 @@ class TestNewRelationEndpointResolution:
         new_rel = next(r for r in result if r.predicate == "partner_of")
         assert new_rel.subject.label == "UNKNOWN"
         assert new_rel.subject.metadata.get("synthetic") is True
-        # Known endpoint should still resolve to canonical
         assert new_rel.object.label == "ORG"
+
+
+# ---------------------------------------------------------------------------
+# Temperature propagation (Finding 6)
+# ---------------------------------------------------------------------------
+
+class TestTemperaturePropagation:
+    """Tests 22–23 — temperature is always forwarded to generate_typed."""
+
+    def test_temperature_none_is_forwarded(self):
+        """Test 22: temperature=None must be forwarded so providers.py can apply
+        its own default (0.1 for instructor) consistently."""
+        original = [_make_entity("Apple Inc.", "ORG")]
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp, temperature=None)
+        extractor.enhance_entities("Apple Inc.", original)
+
+        call_kwargs = extractor.provider.generate_typed.call_args[1]
+        assert "temperature" in call_kwargs, (
+            "temperature must always be passed to generate_typed"
+        )
+        assert call_kwargs["temperature"] is None
+
+    def test_explicit_temperature_is_forwarded(self):
+        """Test 23: an explicit temperature value is forwarded unchanged."""
+        original = [_make_entity("Apple Inc.", "ORG")]
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp, temperature=0.7)
+        extractor.enhance_entities("Apple Inc.", original)
+
+        call_kwargs = extractor.provider.generate_typed.call_args[1]
+        assert call_kwargs.get("temperature") == pytest.approx(0.7)
+
+    def test_option_temperature_overrides_instance(self):
+        """Per-call temperature option takes priority over instance temperature."""
+        original = [_make_entity("Apple Inc.", "ORG")]
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp, temperature=0.5)
+        extractor.enhance_entities("Apple Inc.", original, temperature=0.2)
+
+        call_kwargs = extractor.provider.generate_typed.call_args[1]
+        assert call_kwargs.get("temperature") == pytest.approx(0.2)
+
+    def test_temperature_none_also_forwarded_for_relations(self):
+        """Temperature=None is forwarded for relation enhancement too."""
+        original = [_make_relation("Apple Inc.", "founded_by", "Steve Jobs")]
+        llm_resp = RelationsResponse(relations=[
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp, temperature=None)
+        extractor.enhance_relations("text", original)
+
+        call_kwargs = extractor.provider.generate_typed.call_args[1]
+        assert "temperature" in call_kwargs
+        assert call_kwargs["temperature"] is None
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive matching
+# ---------------------------------------------------------------------------
+
+class TestCaseInsensitiveMatching:
+    """Tests 24–25 — matching is case-insensitive."""
+
+    def test_entity_match_is_case_insensitive(self):
+        """Test 24: entity matched case-insensitively; original casing preserved."""
+        original = [_make_entity("apple inc.", "PRODUCT")]
+
+        llm_resp = EntitiesResponse(entities=[
+            EntityOut(text="Apple Inc.", label="ORG", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_entities("text", original)
+
+        assert len(result) == 1
+        assert result[0].label == "ORG"
+
+    def test_relation_match_is_case_insensitive(self):
+        """Test 25: relation (subj, obj) matched case-insensitively."""
+        original = [_make_relation("apple inc.", "related_to", "steve jobs")]
+
+        llm_resp = RelationsResponse(relations=[
+            RelationOut(subject="Apple Inc.", predicate="founded_by",
+                        object="Steve Jobs", confidence=0.97),
+        ])
+        extractor = _make_extractor(llm_resp)
+        result = extractor.enhance_relations("text", original)
+
+        assert len(result) == 1
+        assert result[0].predicate == "founded_by"

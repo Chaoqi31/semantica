@@ -60,8 +60,9 @@ Author: Semantica Contributors
 License: MIT
 """
 
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List
 
 from ..utils.exceptions import ProcessingError
 from ..utils.logging import get_logger
@@ -87,6 +88,33 @@ class LLMResponse:
     model: str
     usage: Dict[str, Any]
     metadata: Dict[str, Any]
+
+
+def _find_span_in_text(needle: str, text: str, occupied: set) -> tuple:
+    """Return the ``(start, end)`` character span for the first occurrence of
+    *needle* in *text* that is not already in *occupied*.
+
+    Uses the same word-boundary pattern as
+    :meth:`~.ner_extractor.NERExtractor._align_entities_to_text` so that
+    ``Apple`` does not match inside ``Applesauce``.
+
+    Returns ``(0, 0)`` — the conventional "unknown span" sentinel — when no
+    unoccupied match is found rather than fabricating a position.
+    """
+    if not needle or not text:
+        return (0, 0)
+
+    left_boundary = r"(?<!\w)" if (needle[0].isalnum() or needle[0] == "_") else ""
+    right_boundary = r"(?!\w)" if (needle[-1].isalnum() or needle[-1] == "_") else ""
+    pattern = re.compile(
+        left_boundary + re.escape(needle) + right_boundary,
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        span = (m.start(), m.end())
+        if span not in occupied:
+            return span
+    return (0, 0)
 
 
 class LLMExtraction:
@@ -120,7 +148,7 @@ class LLMExtraction:
             provider_config = config.copy()
             if "api_key" in provider_config and not provider_config["api_key"]:
                 del provider_config["api_key"]
-                
+
             self.provider = create_provider(provider, **provider_config)
         except Exception as e:
             self.logger.warning(f"Failed to initialize {provider} provider: {e}")
@@ -168,10 +196,14 @@ class LLMExtraction:
         response using :class:`~.schemas.EntitiesResponse`, and merges the
         result back into the original entity list:
 
-        - Existing entities whose text matches an LLM-returned entity have
-          their ``label`` and ``confidence`` updated.
+        - Existing entities whose text matches an LLM-returned entity (case-
+          insensitive) have their ``label`` and ``confidence`` updated.  When the
+          same surface text appears at multiple offsets, **all** occurrences are
+          updated.
         - New entities returned by the LLM that have no match in the original
-          list are appended.
+          list are appended.  Their character spans are located in ``text`` using
+          a word-boundary search (same convention as the NER aligner); the span
+          is ``(0, 0)`` when the text cannot be found.
         - Original entities not mentioned by the LLM are preserved unchanged.
         - All returned entities carry ``enhanced_by`` and ``model`` metadata.
 
@@ -181,7 +213,7 @@ class LLMExtraction:
         Args:
             text: Input text
             entities: Pre-extracted entities
-            **options: Enhancement options
+            **options: Enhancement options (``temperature`` overrides instance default)
 
         Returns:
             list: Enhanced entities
@@ -224,9 +256,12 @@ class LLMExtraction:
             self.progress_tracker.update_tracking(
                 tracking_id, message="Calling LLM API..."
             )
-            gen_kwargs: Dict[str, Any] = {}
-            if options.get("temperature", self.temperature) is not None:
-                gen_kwargs["temperature"] = options.get("temperature", self.temperature)
+            # Always forward temperature (even None) so generate_typed can apply
+            # its own provider-level default consistently regardless of whether
+            # the instructor fast-path or the manual repair loop is active.
+            gen_kwargs: Dict[str, Any] = {
+                "temperature": options.get("temperature", self.temperature),
+            }
             response_obj = self.provider.generate_typed(
                 prompt, schema=EntitiesResponse, **gen_kwargs
             )
@@ -234,7 +269,7 @@ class LLMExtraction:
             self.progress_tracker.update_tracking(
                 tracking_id, message="Parsing LLM response..."
             )
-            enhanced_entities = self._parse_entity_response(response_obj, entities)
+            enhanced_entities = self._parse_entity_response(response_obj, entities, text)
 
             self.progress_tracker.stop_tracking(
                 tracking_id,
@@ -259,10 +294,15 @@ class LLMExtraction:
         response using :class:`~.schemas.RelationsResponse`, and merges the
         result back into the original relation list:
 
-        - Existing relations whose subject+object pair matches an LLM-returned
-          relation have their ``predicate`` and ``confidence`` updated.
-        - New relations returned by the LLM that have no match in the original
-          list are appended.
+        - Existing relations whose ``(subject.text, object.text)`` pair matches
+          an LLM-returned relation (case-insensitive) have their ``predicate``
+          and ``confidence`` updated.  When multiple relations share the same
+          subject/object pair, **all** matching relations are updated.
+        - New relations returned by the LLM whose ``(subject, object)`` pair is
+          not present in the original list are appended.  Subject/object entities
+          are resolved against the canonical entity pool from the original
+          relations; unresolved endpoints become synthetic UNKNOWN entities
+          (consistent with :func:`~.methods._parse_relation_result`).
         - Original relations not affected by the LLM response are preserved.
         - All returned relations carry ``enhanced_by`` and ``model`` metadata.
 
@@ -271,7 +311,7 @@ class LLMExtraction:
         Args:
             text: Input text
             relations: Pre-extracted relations
-            **options: Enhancement options
+            **options: Enhancement options (``temperature`` overrides instance default)
 
         Returns:
             list: Enhanced relations
@@ -292,9 +332,9 @@ class LLMExtraction:
         prompt = self._build_relation_prompt(text, relations)
 
         try:
-            gen_kwargs: Dict[str, Any] = {}
-            if options.get("temperature", self.temperature) is not None:
-                gen_kwargs["temperature"] = options.get("temperature", self.temperature)
+            gen_kwargs: Dict[str, Any] = {
+                "temperature": options.get("temperature", self.temperature),
+            }
             response_obj = self.provider.generate_typed(
                 prompt, schema=RelationsResponse, **gen_kwargs
             )
@@ -376,25 +416,27 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
         self,
         response_obj: Any,
         original_entities: List[Entity],
+        text: str = "",
     ) -> List[Entity]:
         """Merge the LLM-returned :class:`~.schemas.EntitiesResponse` into the
         original entity list.
 
         Merge strategy:
 
-        * For every entity returned by the LLM, look for an existing entity
-          with the same text (case-insensitive).  If found, update its
-          ``label`` and ``confidence`` in-place (on a copy so the caller's
-          original list is not mutated).
+        * For every entity returned by the LLM, look for **all** existing
+          entities with the same text (case-insensitive).  Each match has its
+          ``label`` and ``confidence`` updated.  This covers the repeated-mention
+          case: if "Apple" appears at three offsets, all three are updated.
         * LLM-returned entities with no match in the original list are
-          **appended** as new entities (``start_char``/``end_char`` default to
-          0 because the LLM does not reliably return character offsets).
+          **appended** as new entities.  Their character span is located in
+          *text* using a word-boundary search so downstream span-dependent code
+          (chunking, semantic network extraction) receives a usable offset.  When
+          the text cannot be found the span is ``(0, 0)`` — the conventional
+          "unknown" sentinel used throughout the project.
         * Original entities absent from the LLM response are **preserved**.
         * All returned entities carry ``enhanced_by`` / ``model`` metadata.
-        * If ``response_obj`` is empty or unusable the original list is
-          returned unchanged (no silent data loss).
+        * Empty/unusable responses return the original list unchanged.
         """
-        # Guard: nothing from the LLM → return originals as-is
         llm_entities = getattr(response_obj, "entities", None)
         if not llm_entities:
             self.logger.debug(
@@ -406,12 +448,13 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 entity.metadata.update({"enhanced_by": self.provider_name, "model": self.model})
             return original_entities
 
-        # Build a lookup from lowercased text → index in the working copy
+        # Build a lookup: lowercased text → list of indices in the working copy.
+        # Using a list (not a single int) correctly handles repeated mentions at
+        # different character offsets — all occurrences are updated.
         working: List[Entity] = []
-        text_to_idx: Dict[str, int] = {}
+        text_to_indices: Dict[str, List[int]] = {}
         for entity in original_entities:
             idx = len(working)
-            # Deep-copy metadata so we don't mutate the caller's objects
             new_meta = dict(entity.metadata) if entity.metadata else {}
             working.append(Entity(
                 text=entity.text,
@@ -421,32 +464,46 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 confidence=entity.confidence,
                 metadata=new_meta,
             ))
-            text_to_idx[entity.text.lower()] = idx
+            text_to_indices.setdefault(entity.text.lower(), []).append(idx)
+
+        # Track spans already used by existing entities for the span-recovery
+        # logic so new entities never overlap with pre-existing ones.
+        occupied_spans: set = {
+            (e.start_char, e.end_char)
+            for e in working
+            if e.start_char != 0 or e.end_char != 0
+        }
 
         seen_new: set = set()  # guard against duplicate new entities
 
         for e_out in llm_entities:
             key = e_out.text.lower()
-            if key in text_to_idx:
-                # Update existing entity
-                existing = working[text_to_idx[key]]
-                if e_out.label:
-                    existing.label = e_out.label
-                if e_out.confidence is not None:
-                    existing.confidence = e_out.confidence
-                existing.metadata.update({
-                    "enhanced_by": self.provider_name,
-                    "model": self.model,
-                })
+            if key in text_to_indices:
+                # Update every occurrence of this entity text
+                for idx in text_to_indices[key]:
+                    existing = working[idx]
+                    if e_out.label:
+                        existing.label = e_out.label
+                    if e_out.confidence is not None:
+                        existing.confidence = e_out.confidence
+                    existing.metadata.update({
+                        "enhanced_by": self.provider_name,
+                        "model": self.model,
+                    })
             else:
-                # New entity from LLM — append only once
+                # New entity from LLM — append only once per unique text
                 if key not in seen_new:
                     seen_new.add(key)
+                    # Attempt to locate the entity in the source text so
+                    # downstream span-dependent code receives a usable offset.
+                    start, end = _find_span_in_text(e_out.text, text, occupied_spans)
+                    if start != 0 or end != 0:
+                        occupied_spans.add((start, end))
                     working.append(Entity(
                         text=e_out.text,
                         label=e_out.label or "UNKNOWN",
-                        start_char=0,
-                        end_char=0,
+                        start_char=start,
+                        end_char=end,
                         confidence=e_out.confidence,
                         metadata={
                             "enhanced_by": self.provider_name,
@@ -475,22 +532,27 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
 
         Merge strategy:
 
-        * For every relation returned by the LLM, look for an existing relation
-          whose ``(subject.text, predicate, object.text)`` triple all match
-          (case-insensitive).  If found, update its ``confidence`` (the predicate
-          already matches, so there is nothing else to update on an exact triple
-          match).
-        * If the LLM returns a relation with a matching ``(subject, object)`` but
-          a **different** predicate, that is treated as a **new** relation and
-          appended — multiple predicates between the same entity pair are
-          legitimate in a property graph.
-        * LLM-returned relations with no match in the original list are
-          **appended** as new relations. Subject/object entities are resolved
-          against the subjects/objects already present in the original list;
-          unresolved endpoints become synthetic UNKNOWN entities.
-        * Original relations absent from the LLM response are **preserved**.
+        * For every relation returned by the LLM, look for **all** existing
+          relations whose ``(subject.text, object.text)`` pair matches
+          (case-insensitive).  Each match has its ``predicate`` and
+          ``confidence`` updated.  This is the intended enhancement contract:
+          the LLM can correct a generic "related_to" predicate to a specific
+          "founded_by" predicate.  When multiple relations share the same
+          endpoints, all of them receive the updated predicate and confidence.
+        * LLM-returned relations whose ``(subject, object)`` pair is not present
+          in the original list are **appended** as new relations.  Subject/object
+          entities are resolved against the canonical entity pool from the
+          original relations; unresolved endpoints become synthetic UNKNOWN
+          entities (consistent with :func:`~.methods._parse_relation_result`).
+        * Original relations not affected by the LLM response are **preserved**.
         * All returned relations carry ``enhanced_by`` / ``model`` metadata.
         * Empty/unusable responses preserve the original list unchanged.
+
+        Note on duplicate input relations: if the original list already contains
+        duplicate ``(subject, predicate, object)`` triples, only the first
+        occurrence's index is tracked.  The enhancement update still applies to
+        that first copy; later duplicates are preserved unchanged and carry the
+        ``enhanced_by`` stamp from the final metadata pass.
         """
         llm_relations = getattr(response_obj, "relations", None)
         if not llm_relations:
@@ -503,12 +565,11 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 rel.metadata.update({"enhanced_by": self.provider_name, "model": self.model})
             return original_relations
 
-        # Build a lookup: (subj_lower, predicate_lower, obj_lower) → index in
-        # working copy.  Including the predicate ensures that two relations with
-        # the same endpoints but different predicates are treated as distinct
-        # relations and never accidentally merged.
+        # Build a lookup: (subj_lower, obj_lower) → list of indices in working
+        # copy.  Using a list correctly handles multiple relations with the same
+        # endpoints but different predicates — all are updated together.
         working: List[Relation] = []
-        triple_to_idx: Dict[tuple, int] = {}
+        pair_to_indices: Dict[tuple, List[int]] = {}
         for rel in original_relations:
             idx = len(working)
             new_meta = dict(rel.metadata) if rel.metadata else {}
@@ -520,13 +581,8 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
                 context=rel.context,
                 metadata=new_meta,
             ))
-            key = (
-                rel.subject.text.lower(),
-                rel.predicate.lower(),
-                rel.object.text.lower(),
-            )
-            # Keep first occurrence only (guarding against pre-existing duplicates)
-            triple_to_idx.setdefault(key, idx)
+            pair_key = (rel.subject.text.lower(), rel.object.text.lower())
+            pair_to_indices.setdefault(pair_key, []).append(idx)
 
         # Build a flat entity pool from original relations for endpoint resolution
         entity_pool: List[Entity] = []
@@ -547,28 +603,26 @@ Example: {{"relations": [{{"subject": "Apple", "predicate": "founded_by", "objec
             if not subj_text or not obj_text:
                 continue
 
-            triple_key = (
-                subj_text.lower(),
-                pred_text.lower(),
-                obj_text.lower(),
-            )
+            pair_key = (subj_text.lower(), obj_text.lower())
 
-            if triple_key in triple_to_idx:
-                # Exact triple match — update only the confidence
-                existing = working[triple_to_idx[triple_key]]
-                if r_out.confidence is not None:
-                    existing.confidence = r_out.confidence
-                existing.metadata.update({
-                    "enhanced_by": self.provider_name,
-                    "model": self.model,
-                })
+            if pair_key in pair_to_indices:
+                # Update every relation with this subject/object pair
+                for idx in pair_to_indices[pair_key]:
+                    existing = working[idx]
+                    if pred_text:
+                        existing.predicate = pred_text
+                    if r_out.confidence is not None:
+                        existing.confidence = r_out.confidence
+                    existing.metadata.update({
+                        "enhanced_by": self.provider_name,
+                        "model": self.model,
+                    })
             else:
-                # No match — append as a new relation (once per unique triple)
-                if triple_key not in seen_new:
-                    seen_new.add(triple_key)
+                # New relation — append once per unique (subj, obj) pair
+                if pair_key not in seen_new:
+                    seen_new.add(pair_key)
 
-                    # Resolve endpoints against the existing entity pool so the
-                    # new relation reuses canonical Entity objects where available
+                    # Resolve endpoints against the canonical entity pool
                     subj_entity = next(
                         (e for e in entity_pool if e.text.lower() == subj_text.lower()),
                         Entity(
