@@ -625,7 +625,7 @@ class TestCustomProviderShadowing(unittest.TestCase):
             side_effect=_mock_openai_cls([]),
         ) as MockGemini:
             with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-gemini"}, clear=False):
-                p_builtin = self.pool.get("gemini", model="gemini-pro")
+                self.pool.get("gemini", model="gemini-pro")
 
         # Built-in path was taken (GeminiProvider was instantiated).
         MockGemini.assert_called_once()
@@ -918,14 +918,6 @@ class TestNestedProviderCreation(unittest.TestCase):
         import time
 
         DELAY = 0.1  # 100 ms construction delay per provider
-
-        def slow_factory_a(*args, **kwargs):
-            time.sleep(DELAY)
-            return MagicMock(name="provider-a")
-
-        def slow_factory_b(*args, **kwargs):
-            time.sleep(DELAY)
-            return MagicMock(name="provider-b")
 
         started = threading.Barrier(2)
         results = {}
