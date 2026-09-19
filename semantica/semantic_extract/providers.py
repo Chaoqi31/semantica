@@ -70,6 +70,7 @@ License: MIT
 """
 
 import json
+import threading
 import time
 from typing import Any, Dict, List, Optional, Union, Type
 
@@ -1784,19 +1785,133 @@ class HuggingFaceModelLoader:
 
 
 class ProviderPool:
-    """Pool for reusing provider instances."""
+    """Pool for reusing provider instances.
+
+    Thread-safety
+    -------------
+    ``get()`` uses a lock with double-checked locking so that the
+    check / construct / store sequence is atomic.  Provider construction
+    (which may involve a network probe, e.g. ``ollama.Client.list()``) is
+    intentionally performed *inside* the lock because pool entries are
+    created at most once per unique configuration; holding the lock
+    briefly during that first-time construction is far preferable to the
+    correctness hazard of concurrent duplicate construction.
+
+    Credential isolation
+    --------------------
+    Every built-in provider resolves its API key through the fallback
+    chain ``explicit kwarg → config.get_api_key() → env var`` inside its
+    ``__init__``.  ``get()`` mirrors that same resolution *before*
+    computing the cache key so that the effective credential is always
+    part of the key.  Two calls that resolve to different credentials
+    therefore receive different cached instances.
+
+    Providers that do not use an API key (``ollama``, ``huggingface_llm``)
+    are unaffected: ``_resolve_api_key`` returns ``None`` for them and
+    no kwarg is injected.
+    """
+
+    # Names of built-in providers that accept an ``api_key`` constructor
+    # argument and whose credential must be resolved before key computation.
+    _API_KEY_PROVIDERS = frozenset(
+        {"openai", "gemini", "groq", "anthropic", "deepseek", "novita"}
+    )
 
     def __init__(self):
         self._providers: Dict[str, BaseProvider] = {}
+        self._lock = threading.Lock()
         self.logger = get_logger("provider_pool")
 
-    def get(self, name: str, **kwargs) -> BaseProvider:
-        """Get or create a provider instance."""
-        # Create a cache key from name and kwargs
-        # Filter out non-hashable items or volatile args if any
-        # For now, we assume kwargs are configuration options that should match
+    # ------------------------------------------------------------------
+    # Credential resolution
+    # ------------------------------------------------------------------
 
-        # Helper to make dict hashable
+    def _resolve_api_key(self, name: str, kwargs: dict) -> Optional[str]:
+        """Return the effective API key for *name* using the same fallback
+        chain that the provider's ``__init__`` would use:
+
+        1. Explicit ``api_key`` kwarg (already supplied by the caller).
+        2. ``config.get_api_key(name)`` — checks the in-memory Config
+           singleton first, then falls back to the ``{NAME}_API_KEY``
+           environment variable.
+
+        Returns ``None`` if the provider does not use an API key (e.g.
+        Ollama, HuggingFace) or if no key is found anywhere.
+
+        The returned value is intentionally *not* logged so that
+        credentials do not appear in log output.
+        """
+        if name.lower() not in self._API_KEY_PROVIDERS:
+            return None
+
+        # Explicit kwarg takes precedence — already in the pool key via
+        # normal kwargs serialisation, but we still return it here so
+        # the caller can normalise the kwargs dict uniformly.
+        explicit = kwargs.get("api_key")
+        if explicit:
+            return explicit
+
+        # Mirror the provider __init__ fallback: config singleton → env var.
+        return config.get_api_key(name.lower()) or None
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def get(self, name: str, **kwargs) -> BaseProvider:
+        """Return a cached provider for the given *name* and configuration.
+
+        The effective API key (resolved through the full fallback chain) is
+        injected into *kwargs* before the cache key is computed, ensuring
+        that two callers whose credentials differ—even if neither passed an
+        explicit ``api_key``—receive different cached instances.
+        """
+        # Resolve the effective credential and normalise kwargs so the key
+        # captures it even when the caller relied on env-var resolution.
+        resolved_key = self._resolve_api_key(name, kwargs)
+        if resolved_key and not kwargs.get("api_key"):
+            # Inject the resolved key so it participates in the cache key
+            # and is passed through to the provider constructor.
+            kwargs = {**kwargs, "api_key": resolved_key}
+
+        key = self._make_key(name, **kwargs)
+
+        # Fast path: read without acquiring the lock.  Because entries are
+        # only ever stored after construction completes (inside the lock
+        # below), any value returned here is a fully-initialised provider.
+        # A concurrent ``clear()`` between this read and the lock acquisition
+        # is harmless: the re-check inside the lock will see the empty dict
+        # and trigger a fresh construction.
+        provider = self._providers.get(key)
+        if provider is not None:
+            return provider
+
+        # Slow path: lock, re-check, create.
+        with self._lock:
+            # Re-check inside the lock: another thread may have created
+            # the entry between our fast-path miss and acquiring the lock.
+            provider = self._providers.get(key)
+            if provider is not None:
+                return provider
+
+            self.logger.debug("Creating new provider instance for %s", name)
+            provider = self._create_provider(name, **kwargs)
+            self._providers[key] = provider
+            return provider
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_key(name: str, **kwargs) -> str:
+        """Compute a deterministic string key from *name* and *kwargs*.
+
+        All kwargs values participate in the key (including ``api_key``
+        when present) so that instances with different configurations are
+        never aliased.  Nested dicts and lists are normalised to tuples
+        so the resulting string is stable.
+        """
         def make_hashable(value):
             if isinstance(value, dict):
                 return tuple(sorted((k, make_hashable(v)) for k, v in value.items()))
@@ -1806,22 +1921,13 @@ class ProviderPool:
 
         key_parts = [name]
         for k, v in sorted(kwargs.items()):
-            # Skip some keys if they shouldn't affect pooling?
-            # For now, all init args matter for the instance identity.
             key_parts.append((k, make_hashable(v)))
-
-        key = str(tuple(key_parts))
-
-        if key in self._providers:
-            return self._providers[key]
-
-        self.logger.debug(f"Creating new provider instance for {name}")
-        provider = self._create_provider(name, **kwargs)
-        self._providers[key] = provider
-        return provider
+        return str(tuple(key_parts))
 
     def _create_provider(self, name: str, **kwargs) -> BaseProvider:
-        """Internal creation logic."""
+        """Instantiate and return a new provider.  Called only when the
+        cache does not yet contain an entry for the resolved key.
+        """
         # Check registry first
         custom_provider = provider_registry.get(name)
         if custom_provider:
@@ -1849,7 +1955,8 @@ class ProviderPool:
 
     def clear(self):
         """Clear the provider pool."""
-        self._providers.clear()
+        with self._lock:
+            self._providers.clear()
 
 
 # Global provider pool
