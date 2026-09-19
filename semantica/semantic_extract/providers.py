@@ -1789,37 +1789,60 @@ class ProviderPool:
 
     Thread-safety
     -------------
-    ``get()`` uses a lock with double-checked locking so that the
-    check / construct / store sequence is atomic.  Provider construction
-    (which may involve a network probe, e.g. ``ollama.Client.list()``) is
-    intentionally performed *inside* the lock because pool entries are
-    created at most once per unique configuration; holding the lock
-    briefly during that first-time construction is far preferable to the
-    correctness hazard of concurrent duplicate construction.
+    ``get()`` uses per-key ``threading.Event`` objects to serialise
+    concurrent first-time construction of the *same* key without holding
+    any lock during the (potentially slow) provider construction itself.
+    Unrelated keys are therefore built concurrently.
+
+    A short-lived ``_meta_lock`` guards only the in-memory bookkeeping
+    dicts (``_providers``, ``_in_progress``); it is never held while a
+    provider constructor runs.
+
+    Same-thread re-entrancy (a provider constructor that calls
+    ``create_provider()`` for the *same key* it is currently building) is
+    detected via a ``threading.local`` set and handled by constructing a
+    fresh instance directly rather than waiting on the in-progress event
+    (which would deadlock).  Nested calls for *different* keys proceed
+    normally through the pool.
 
     Credential isolation
     --------------------
-    Every built-in provider resolves its API key through the fallback
-    chain ``explicit kwarg → config.get_api_key() → env var`` inside its
+    Every *built-in* provider that is not shadowed by a registered custom
+    provider resolves its API key through the fallback chain
+    ``explicit kwarg → config.get_api_key() → env var`` inside its
     ``__init__``.  ``get()`` mirrors that same resolution *before*
     computing the cache key so that the effective credential is always
     part of the key.  Two calls that resolve to different credentials
     therefore receive different cached instances.
 
+    Custom providers registered via ``provider_registry`` (even those
+    registered under a built-in name such as ``"openai"``) are never
+    given an automatically injected ``api_key``; only kwargs explicitly
+    supplied by the caller are forwarded to them.
+
     Providers that do not use an API key (``ollama``, ``huggingface_llm``)
-    are unaffected: ``_resolve_api_key`` returns ``None`` for them and
-    no kwarg is injected.
+    are unaffected: ``_resolve_api_key`` returns ``None`` for them and no
+    kwarg is injected.
     """
 
-    # Names of built-in providers that accept an ``api_key`` constructor
+    # Names of *built-in* providers that accept an ``api_key`` constructor
     # argument and whose credential must be resolved before key computation.
+    # Credential injection is skipped when a custom provider is registered
+    # under one of these names.
     _API_KEY_PROVIDERS = frozenset(
         {"openai", "gemini", "groq", "anthropic", "deepseek", "novita"}
     )
 
     def __init__(self):
         self._providers: Dict[str, BaseProvider] = {}
-        self._lock = threading.Lock()
+        # Per-key in-progress events: present while a builder thread is
+        # constructing the provider for that key.
+        self._in_progress: Dict[str, threading.Event] = {}
+        # Guards _providers and _in_progress; never held during construction.
+        self._meta_lock = threading.Lock()
+        # Per-thread set of keys currently being built by this thread.
+        # Used to detect same-key re-entrancy.
+        self._local = threading.local()
         self.logger = get_logger("provider_pool")
 
     # ------------------------------------------------------------------
@@ -1828,15 +1851,20 @@ class ProviderPool:
 
     def _resolve_api_key(self, name: str, kwargs: dict) -> Optional[str]:
         """Return the effective API key for *name* using the same fallback
-        chain that the provider's ``__init__`` would use:
+        chain that the built-in provider's ``__init__`` would use:
 
         1. Explicit ``api_key`` kwarg (already supplied by the caller).
         2. ``config.get_api_key(name)`` — checks the in-memory Config
            singleton first, then falls back to the ``{NAME}_API_KEY``
            environment variable.
 
-        Returns ``None`` if the provider does not use an API key (e.g.
-        Ollama, HuggingFace) or if no key is found anywhere.
+        Returns ``None`` when:
+        * the provider name is not in ``_API_KEY_PROVIDERS`` (e.g. Ollama,
+          HuggingFace), or
+        * a custom provider is registered under *name* — custom providers
+          must receive only the kwargs the caller explicitly supplied, never
+          an automatically injected ``api_key``, or
+        * no key can be found anywhere.
 
         The returned value is intentionally *not* logged so that
         credentials do not appear in log output.
@@ -1844,14 +1872,18 @@ class ProviderPool:
         if name.lower() not in self._API_KEY_PROVIDERS:
             return None
 
-        # Explicit kwarg takes precedence — already in the pool key via
-        # normal kwargs serialisation, but we still return it here so
-        # the caller can normalise the kwargs dict uniformly.
+        # If a custom provider is registered under this name, do not inject
+        # an api_key — the custom class may not accept that parameter.
+        if provider_registry.get(name):
+            return None
+
+        # Explicit kwarg takes precedence.
         explicit = kwargs.get("api_key")
         if explicit:
             return explicit
 
-        # Mirror the provider __init__ fallback: config singleton → env var.
+        # Mirror the built-in provider __init__ fallback:
+        # config singleton → env var.
         return config.get_api_key(name.lower()) or None
 
     # ------------------------------------------------------------------
@@ -1861,43 +1893,101 @@ class ProviderPool:
     def get(self, name: str, **kwargs) -> BaseProvider:
         """Return a cached provider for the given *name* and configuration.
 
-        The effective API key (resolved through the full fallback chain) is
-        injected into *kwargs* before the cache key is computed, ensuring
-        that two callers whose credentials differ—even if neither passed an
-        explicit ``api_key``—receive different cached instances.
+        For built-in API-key providers (when not shadowed by a custom
+        registration), the effective API key is resolved and injected into
+        *kwargs* before the cache key is computed so that two callers
+        whose credentials differ receive different cached instances even
+        when neither passed an explicit ``api_key``.
+
+        Concurrent first-time requests for the same key are serialised via
+        a per-key ``threading.Event``; the provider is constructed exactly
+        once.  If construction raises, any threads waiting on that key retry
+        and become the new builder (or find a result from a concurrent
+        successful attempt).
+
+        If the calling thread is already building this exact key (i.e. a
+        provider constructor calls back into the pool for the same key), a
+        fresh instance is returned directly to avoid deadlock.  Nested calls
+        for *different* keys go through the normal pool path.
         """
         # Resolve the effective credential and normalise kwargs so the key
         # captures it even when the caller relied on env-var resolution.
         resolved_key = self._resolve_api_key(name, kwargs)
         if resolved_key and not kwargs.get("api_key"):
-            # Inject the resolved key so it participates in the cache key
-            # and is passed through to the provider constructor.
             kwargs = {**kwargs, "api_key": resolved_key}
 
         key = self._make_key(name, **kwargs)
 
-        # Fast path: read without acquiring the lock.  Because entries are
-        # only ever stored after construction completes (inside the lock
-        # below), any value returned here is a fully-initialised provider.
-        # A concurrent ``clear()`` between this read and the lock acquisition
-        # is harmless: the re-check inside the lock will see the empty dict
-        # and trigger a fresh construction.
+        # ---------- fast path (no lock) ----------
         provider = self._providers.get(key)
         if provider is not None:
             return provider
 
-        # Slow path: lock, re-check, create.
-        with self._lock:
-            # Re-check inside the lock: another thread may have created
-            # the entry between our fast-path miss and acquiring the lock.
-            provider = self._providers.get(key)
-            if provider is not None:
-                return provider
+        # ---------- same-thread re-entrancy guard ----------
+        # If *this thread* is already building this key (nested call from
+        # inside a constructor), bypass the pool entirely to avoid waiting
+        # on an event that this thread will never signal.
+        building = getattr(self._local, "building", None)
+        if building is None:
+            building = set()
+            self._local.building = building
 
-            self.logger.debug("Creating new provider instance for %s", name)
-            provider = self._create_provider(name, **kwargs)
-            self._providers[key] = provider
-            return provider
+        if key in building:
+            self.logger.debug(
+                "Re-entrant get() for %s — constructing fresh instance to avoid deadlock",
+                name,
+            )
+            return self._create_provider(name, **kwargs)
+
+        # ---------- slow path: serialise per-key ----------
+        while True:
+            with self._meta_lock:
+                # Re-check under the meta-lock.
+                provider = self._providers.get(key)
+                if provider is not None:
+                    return provider
+
+                existing_event = self._in_progress.get(key)
+                if existing_event is not None:
+                    # Another thread is building; we will wait outside the lock.
+                    wait_event = existing_event
+                else:
+                    # This thread becomes the builder.
+                    wait_event = None
+                    build_event = threading.Event()
+                    self._in_progress[key] = build_event
+
+            if wait_event is not None:
+                # Wait for the builder thread; then re-enter the loop so we
+                # pick up the result (or retry if it failed).
+                wait_event.wait()
+                # After the event fires, check if the result was stored.
+                provider = self._providers.get(key)
+                if provider is not None:
+                    return provider
+                # Builder failed — loop again: this thread will become the
+                # next builder if no other thread already is.
+                continue
+
+            # This thread is the builder — construct outside every lock.
+            building.add(key)
+            try:
+                self.logger.debug("Creating new provider instance for %s", name)
+                provider = self._create_provider(name, **kwargs)
+                with self._meta_lock:
+                    self._providers[key] = provider
+                    self._in_progress.pop(key, None)
+                build_event.set()
+                return provider
+            except Exception:
+                # Signal waiting threads so they don't block forever, then
+                # remove the in-progress entry so a subsequent call can retry.
+                with self._meta_lock:
+                    self._in_progress.pop(key, None)
+                build_event.set()
+                raise
+            finally:
+                building.discard(key)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1954,9 +2044,18 @@ class ProviderPool:
         return provider_class(**kwargs)
 
     def clear(self):
-        """Clear the provider pool."""
-        with self._lock:
+        """Clear the provider pool.
+
+        Waits for any in-progress constructions to complete or fail before
+        discarding cached entries, so callers that obtained a reference just
+        before ``clear()`` still hold a valid object.
+        """
+        with self._meta_lock:
             self._providers.clear()
+            # In-progress events are intentionally left intact: threads
+            # waiting on them will re-try after the event fires and find
+            # an empty pool, becoming new builders.  This avoids forcing
+            # waiting threads to deal with a stale event after clear().
 
 
 # Global provider pool

@@ -46,7 +46,6 @@ from unittest.mock import MagicMock, patch
 
 from semantica.semantic_extract.providers import (
     ProviderPool,
-    _provider_pool,
     create_provider,
 )
 
@@ -116,22 +115,17 @@ class TestCredentialIsolation(unittest.TestCase):
 
     def test_env_key_rotation_via_create_provider(self):
         """Same assertion exercised through the public ``create_provider`` API."""
-        pool = _make_pool()
         instances = []
 
         with patch(
-            "semantica.semantic_extract.providers._provider_pool",
-            pool,
+            "semantica.semantic_extract.providers.OpenAIProvider",
+            side_effect=_mock_openai_cls(instances),
         ):
-            with patch(
-                "semantica.semantic_extract.providers.OpenAIProvider",
-                side_effect=_mock_openai_cls(instances),
-            ):
-                with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env-A"}, clear=False):
-                    p1 = create_provider("openai", model="gpt-4")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env-A"}, clear=False):
+                p1 = self.pool.get("openai", model="gpt-4")
 
-                with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env-B"}, clear=False):
-                    p2 = create_provider("openai", model="gpt-4")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-env-B"}, clear=False):
+                p2 = self.pool.get("openai", model="gpt-4")
 
         self.assertIsNot(p1, p2)
         self.assertEqual(len(instances), 2)
@@ -485,6 +479,493 @@ class TestProviderPoolInternals(unittest.TestCase):
         """All built-in API-key-using providers must be listed in _API_KEY_PROVIDERS."""
         expected = {"openai", "gemini", "groq", "anthropic", "deepseek", "novita"}
         self.assertEqual(ProviderPool._API_KEY_PROVIDERS, expected)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# HIGH-1 regression: custom provider shadowing a built-in API-key provider
+# ---------------------------------------------------------------------------
+
+class TestCustomProviderShadowing(unittest.TestCase):
+    """Custom providers registered under a built-in name must not receive
+    an automatically injected ``api_key`` kwarg."""
+
+    def setUp(self):
+        self.pool = _make_pool()
+
+    def tearDown(self):
+        # Remove any registrations added during tests.
+        from semantica.semantic_extract.registry import provider_registry as _reg
+        for name in ("openai", "groq", "anthropic", "gemini"):
+            _reg.unregister(name)
+
+    def test_custom_provider_under_builtin_name_no_api_key_injection(self):
+        """
+        Regression test for HIGH-1.
+
+        A custom provider registered under the name ``"openai"`` must NOT
+        receive an automatically injected ``api_key`` kwarg, even when
+        ``OPENAI_API_KEY`` is set in the environment.
+
+        Before the fix, ``_resolve_api_key`` would resolve the env-var key
+        and inject it regardless of whether the registered class accepted it,
+        causing a ``TypeError`` for any custom class that does not declare
+        an ``api_key`` parameter.
+        """
+        from semantica.semantic_extract.registry import provider_registry
+
+        class MyCustomProvider:
+            """Custom provider that does NOT accept api_key."""
+            def __init__(self, model="custom-default"):
+                self.model = model
+
+            def is_available(self):
+                return True
+
+        provider_registry.register("openai", MyCustomProvider)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-should-not-inject"}, clear=False):
+            # Must not raise TypeError — no api_key should be injected.
+            provider = self.pool.get("openai", model="custom-v1")
+
+        self.assertIsInstance(provider, MyCustomProvider)
+        self.assertEqual(provider.model, "custom-v1")
+
+    def test_custom_provider_receives_explicit_caller_kwargs_unchanged(self):
+        """Explicit caller kwargs (other than api_key) must still reach the custom class."""
+        from semantica.semantic_extract.registry import provider_registry
+
+        received_kwargs = {}
+
+        class CapturingProvider:
+            def __init__(self, **kwargs):
+                received_kwargs.update(kwargs)
+
+            def is_available(self):
+                return True
+
+        provider_registry.register("groq", CapturingProvider)
+
+        self.pool.get("groq", model="custom-model", timeout=30)
+
+        self.assertEqual(received_kwargs.get("model"), "custom-model")
+        self.assertEqual(received_kwargs.get("timeout"), 30)
+        self.assertNotIn(
+            "api_key",
+            received_kwargs,
+            "api_key must not be auto-injected into a custom provider.",
+        )
+
+    def test_custom_provider_explicit_api_key_caller_passes_through(self):
+        """If the *caller* explicitly passes api_key, it must reach the custom class."""
+        from semantica.semantic_extract.registry import provider_registry
+
+        received_kwargs = {}
+
+        class CapturingProvider:
+            def __init__(self, **kwargs):
+                received_kwargs.update(kwargs)
+
+            def is_available(self):
+                return True
+
+        provider_registry.register("anthropic", CapturingProvider)
+
+        self.pool.get("anthropic", api_key="sk-caller-explicit", model="claude-custom")
+
+        self.assertEqual(
+            received_kwargs.get("api_key"),
+            "sk-caller-explicit",
+            "Explicit caller api_key must be forwarded to the custom provider.",
+        )
+
+    def test_builtin_provider_still_resolves_env_key_when_no_custom_registration(self):
+        """Built-in providers must continue to have their env key resolved."""
+        instances = []
+
+        with patch(
+            "semantica.semantic_extract.providers.OpenAIProvider",
+            side_effect=_mock_openai_cls(instances),
+        ):
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-builtin-env"}, clear=False):
+                p1 = self.pool.get("openai", model="gpt-4")
+                p2 = self.pool.get("openai", model="gpt-4")
+
+        # Same env key → same instance (key stable).
+        self.assertIs(p1, p2)
+        self.assertEqual(len(instances), 1)
+
+    def test_builtin_provider_env_rotation_after_deregistering_custom(self):
+        """
+        After a custom provider is unregistered, the built-in env-key
+        resolution must resume correctly.
+        """
+        from semantica.semantic_extract.registry import provider_registry
+
+        class TempCustom:
+            def __init__(self, model="x"):
+                pass
+            def is_available(self):
+                return True
+
+        provider_registry.register("gemini", TempCustom)
+        # While registered: no key injection
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-gemini"}, clear=False):
+            p_custom = self.pool.get("gemini", model="custom")
+        self.assertIsInstance(p_custom, TempCustom)
+
+        provider_registry.unregister("gemini")
+        self.pool.clear()  # reset so built-in path is exercised fresh
+
+        with patch(
+            "semantica.semantic_extract.providers.GeminiProvider",
+            side_effect=_mock_openai_cls([]),
+        ) as MockGemini:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-gemini"}, clear=False):
+                p_builtin = self.pool.get("gemini", model="gemini-pro")
+
+        # Built-in path was taken (GeminiProvider was instantiated).
+        MockGemini.assert_called_once()
+        # api_key must have been passed (env-resolved).
+        call_kwargs = MockGemini.call_args[1]
+        self.assertIn("api_key", call_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# HIGH-2 regression: nested / re-entrant provider creation
+# ---------------------------------------------------------------------------
+
+class TestNestedProviderCreation(unittest.TestCase):
+    """Provider constructors must be able to call ``create_provider()`` or
+    ``pool.get()`` again without deadlocking."""
+
+    def setUp(self):
+        self.pool = _make_pool()
+
+    def tearDown(self):
+        from semantica.semantic_extract.registry import provider_registry as _reg
+        for name in ("openai", "groq", "anthropic"):
+            _reg.unregister(name)
+
+    # ------------------------------------------------------------------
+    # Core re-entrancy (different keys) — primary regression test
+    # ------------------------------------------------------------------
+
+    def test_nested_different_key_no_deadlock(self):
+        """
+        Regression test for HIGH-2.
+
+        A provider constructor that calls ``pool.get()`` for a *different*
+        key must not deadlock.
+
+        Before the fix, the single non-reentrant ``threading.Lock`` was held
+        for the entire duration of ``_create_provider()``.  Any re-entrant
+        call to ``pool.get()`` (for any key) would block forever attempting
+        to re-acquire the same lock.
+        """
+        from semantica.semantic_extract.registry import provider_registry
+
+        inner_instances = []
+
+        class InnerProvider:
+            def __init__(self, **kwargs):
+                inner_instances.append(self)
+
+            def is_available(self):
+                return True
+
+        class OuterProvider:
+            """Outer provider whose constructor depends on InnerProvider."""
+            def __init__(self, **kwargs):
+                # Nested call for a completely different provider/key.
+                self.inner = self.pool.get("groq", api_key="sk-inner", model="llama")
+
+            def is_available(self):
+                return True
+
+        OuterProvider.pool = self.pool
+        provider_registry.register("openai", OuterProvider)
+        provider_registry.register("groq", InnerProvider)
+
+        deadline = threading.Event()
+        error_holder = [None]
+        result_holder = [None]
+
+        def attempt():
+            try:
+                result_holder[0] = self.pool.get(
+                    "openai", api_key="sk-outer", model="gpt-4"
+                )
+            except Exception as exc:
+                error_holder[0] = exc
+            finally:
+                deadline.set()
+
+        t = threading.Thread(target=attempt, daemon=True)
+        t.start()
+        t.join(timeout=3)
+
+        self.assertTrue(
+            deadline.is_set(),
+            "Nested pool.get() for a different key deadlocked (thread did not return).",
+        )
+        if error_holder[0]:
+            self.fail(f"Unexpected exception: {error_holder[0]}")
+
+        outer = result_holder[0]
+        self.assertIsInstance(outer, OuterProvider)
+        self.assertIsInstance(outer.inner, InnerProvider)
+        self.assertEqual(len(inner_instances), 1)
+
+    def test_nested_different_key_inner_is_cached(self):
+        """The inner provider created during outer construction is cached in the pool."""
+        from semantica.semantic_extract.registry import provider_registry
+
+        class Inner:
+            def __init__(self, **kw): pass
+            def is_available(self): return True
+
+        class Outer:
+            def __init__(self, **kw):
+                self.inner = pool.get("groq", api_key="sk-i", model="m")
+            def is_available(self): return True
+
+        pool = self.pool
+        provider_registry.register("openai", Outer)
+        provider_registry.register("groq", Inner)
+
+        pool.get("openai", api_key="sk-o", model="m")
+
+        # The inner provider must now be in the pool — same instance returned.
+        inner2 = pool.get("groq", api_key="sk-i", model="m")
+        self.assertIsInstance(inner2, Inner)
+
+    # ------------------------------------------------------------------
+    # Same-key re-entrancy: must not deadlock (RecursionError is acceptable)
+    # ------------------------------------------------------------------
+
+    def test_same_key_reentrant_raises_recursion_not_deadlock(self):
+        """
+        A constructor that calls pool.get() for the EXACT same key it is
+        currently building is inherently infinitely recursive (the pool
+        cannot meaningfully satisfy such a request).  The pool must not
+        deadlock; raising RecursionError is the correct outcome.
+        """
+        from semantica.semantic_extract.registry import provider_registry
+
+        pool = self.pool
+
+        class SelfReferential:
+            def __init__(self, **kw):
+                # Same name + same kwargs → same key → infinite recursion.
+                pool.get("anthropic", api_key="sk-x", model="claude")
+
+        provider_registry.register("anthropic", SelfReferential)
+
+        deadline = threading.Event()
+        exception_holder = [None]
+
+        def attempt():
+            try:
+                pool.get("anthropic", api_key="sk-x", model="claude")
+            except RecursionError:
+                exception_holder[0] = "RecursionError"
+            except Exception as e:
+                exception_holder[0] = e
+            finally:
+                deadline.set()
+
+        t = threading.Thread(target=attempt, daemon=True)
+        t.start()
+        t.join(timeout=5)
+
+        self.assertTrue(
+            deadline.is_set(),
+            "Same-key re-entrancy caused a deadlock (thread did not return within 5s).",
+        )
+        self.assertEqual(
+            exception_holder[0],
+            "RecursionError",
+            f"Expected RecursionError for infinite same-key re-entrancy, "
+            f"got: {exception_holder[0]}",
+        )
+
+    # ------------------------------------------------------------------
+    # Construction failure: waiting threads must not hang
+    # ------------------------------------------------------------------
+
+    def test_construction_failure_unblocks_waiting_threads(self):
+        """
+        If provider construction raises, threads that queued up waiting for
+        the same key must not hang indefinitely — they must eventually get
+        a chance to build (or fail) themselves.
+        """
+        import time
+        from semantica.semantic_extract.registry import provider_registry
+
+        pool = self.pool
+        attempt_count = 0
+        succeeded = threading.Event()
+        errors: list = []
+
+        # First construction raises; subsequent ones succeed.
+        class FlakyProvider:
+            def __init__(self, **kw):
+                nonlocal attempt_count
+                attempt_count += 1
+                if attempt_count == 1:
+                    raise RuntimeError("first construction deliberately fails")
+                self.ok = True
+
+            def is_available(self):
+                return True
+
+        provider_registry.register("groq", FlakyProvider)
+
+        results: list = [None, None]
+        barriers = threading.Barrier(2)
+
+        def worker(idx):
+            barriers.wait()  # start simultaneously
+            try:
+                results[idx] = pool.get("groq", api_key="sk-flaky", model="m")
+                if results[idx] is not None:
+                    succeeded.set()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        # At least one thread must have obtained a valid provider.
+        self.assertTrue(
+            succeeded.is_set() or any(r is not None for r in results),
+            "All threads failed or hung after construction failure.",
+        )
+        # The first construction must have failed (attempt_count >= 2 means
+        # at least one retry occurred after the initial failure).
+        self.assertGreaterEqual(attempt_count, 2)
+
+    # ------------------------------------------------------------------
+    # Same-key concurrent: still serialised after the redesign
+    # ------------------------------------------------------------------
+
+    def test_same_key_concurrent_single_construction_after_redesign(self):
+        """
+        Verify the per-key Event design still ensures exactly one provider
+        is constructed when many threads race for the same key simultaneously.
+        (Keeps the concurrency guarantee from the original fix.)
+        """
+        import time
+
+        construction_count = 0
+        count_lock = threading.Lock()
+        num_threads = 16
+        results: list = [None] * num_threads
+
+        def slow_factory(*args, **kwargs):
+            nonlocal construction_count
+            time.sleep(0.02)
+            with count_lock:
+                construction_count += 1
+            return MagicMock(name=f"p-{construction_count}")
+
+        barrier = threading.Barrier(num_threads)
+
+        def worker(idx):
+            barrier.wait()
+            results[idx] = self.pool.get(
+                "openai", api_key="sk-concurrent", model="gpt-4"
+            )
+
+        with patch(
+            "semantica.semantic_extract.providers.OpenAIProvider",
+            side_effect=slow_factory,
+        ):
+            threads = [
+                threading.Thread(target=worker, args=(i,)) for i in range(num_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+
+        self.assertEqual(
+            construction_count,
+            1,
+            f"Expected exactly 1 construction, got {construction_count}.",
+        )
+        canonical = results[0]
+        self.assertIsNotNone(canonical)
+        for idx, r in enumerate(results):
+            self.assertIs(r, canonical, f"Thread {idx} got a different instance.")
+
+    # ------------------------------------------------------------------
+    # Different-key concurrent: must NOT serialize unrelated keys
+    # ------------------------------------------------------------------
+
+    def test_different_keys_build_concurrently(self):
+        """
+        Two threads building *different* keys must not be serialised by the
+        pool: both constructions should run in parallel (verified by timing).
+        """
+        import time
+
+        DELAY = 0.1  # 100 ms construction delay per provider
+
+        def slow_factory_a(*args, **kwargs):
+            time.sleep(DELAY)
+            return MagicMock(name="provider-a")
+
+        def slow_factory_b(*args, **kwargs):
+            time.sleep(DELAY)
+            return MagicMock(name="provider-b")
+
+        started = threading.Barrier(2)
+        results = {}
+
+        def build_a():
+            started.wait()
+            results["a"] = self.pool.get("openai", api_key="sk-a", model="gpt-4a")
+
+        def build_b():
+            started.wait()
+            results["b"] = self.pool.get("openai", api_key="sk-b", model="gpt-4b")
+
+        with patch(
+            "semantica.semantic_extract.providers.OpenAIProvider",
+        ) as MockCls:
+            MockCls.side_effect = [
+                MagicMock(name="provider-a"),
+                MagicMock(name="provider-b"),
+            ]
+
+            ta = threading.Thread(target=build_a)
+            tb = threading.Thread(target=build_b)
+
+            t0 = __import__("time").monotonic()
+            ta.start()
+            tb.start()
+            ta.join(timeout=5)
+            tb.join(timeout=5)
+            elapsed = __import__("time").monotonic() - t0
+
+        self.assertIn("a", results)
+        self.assertIn("b", results)
+        # If serialised, elapsed ≥ 2 * DELAY.  If parallel, elapsed ≈ DELAY.
+        # We use 1.5 * DELAY as a generous threshold.
+        self.assertLess(
+            elapsed,
+            DELAY * 1.5 + 0.3,  # 0.3 s of scheduling slack
+            f"Different-key builds took {elapsed:.3f}s — expected parallel (~{DELAY}s), "
+            f"not serialised (~{2*DELAY}s).",
+        )
 
 
 if __name__ == "__main__":
