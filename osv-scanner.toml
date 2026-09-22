@@ -20,54 +20,11 @@ matching pip-audit exclusion.
 """
 
 # ---------------------------------------------------------------------------
-# uv.lock is a universal lock over EVERY optional extra, so it necessarily
-# includes the opt-in `crewai` extra. crewai==1.6.1 hard-pins
-# `chromadb~=1.1.0` and `json-repair~=0.25.2`; the entries below are reachable
-# only through `pip install semantica[crewai]` (or `uv sync --extra crewai`).
-# The extra is deliberately excluded from `all` (see pyproject.toml), so it is
-# not in requirements-ci.txt and never installed by CI, releases, or a plain
-# `uv sync`. Semantica itself never imports chromadb or json_repair.
-# Re-evaluate once crewai relaxes these pins / ChromaDB ships a fix.
+# chromadb / json-repair (previously pulled in transitively by an opt-in
+# `crewai` extra) are no longer resolvable at all: the `crewai` extra was
+# removed from pyproject.toml because crewai hard-pins `chromadb~=1.1.0` and
+# `json-repair~=0.25.2`, both carrying critical advisories with no fixed
+# release on PyPI. uv.lock no longer contains either package, so there is
+# nothing left to ignore here. See integrations/crewai/README.md for how to
+# use the CrewAI integration with a manually installed crewai.
 # ---------------------------------------------------------------------------
-
-[[IgnoredVulns]]
-id = "GHSA-f4j7-r4q5-qw2c"
-reason = """
-chromadb 1.1.1 (via the opt-in crewai extra only; CVE-2026-45829): pre-auth
-code injection in the ChromaDB *server* collections API. No fixed release
-exists. Semantica does not run a ChromaDB server.
-"""
-
-[[IgnoredVulns]]
-id = "GHSA-36p7-vc44-83pf"
-reason = """
-chromadb 1.1.1 (via the opt-in crewai extra only; CVE-2026-45833): authenticated
-code injection in the ChromaDB *server* collections API. No fixed release
-exists. Semantica does not run a ChromaDB server.
-"""
-
-[[IgnoredVulns]]
-id = "GHSA-xph7-9rjv-w5fr"
-reason = """
-chromadb 1.1.1 (via the opt-in crewai extra only; CVE-2026-45831):
-SimpleRBACAuthorizationProvider ignores tenant/database/collection scope in the
-ChromaDB *server*. No fixed release exists. Semantica does not run a ChromaDB
-server or use its authorization providers.
-"""
-
-[[IgnoredVulns]]
-id = "GHSA-2wm9-hf6c-p5cr"
-reason = """
-chromadb 1.1.1 (via the opt-in crewai extra only; CVE-2026-45830): missing
-tenant authorization checks in the ChromaDB *server*. No fixed release exists.
-Semantica does not run a ChromaDB server.
-"""
-
-[[IgnoredVulns]]
-id = "GHSA-xf7x-x43h-rpqh"
-reason = """
-json-repair 0.25.2 (via the opt-in crewai extra only): unbounded CPU use when
-json_repair's SchemaRepairer follows a circular JSON Schema $ref. The fix
-(0.60.1) is blocked by crewai's json-repair~=0.25.2 pin. Semantica does not
-import json_repair or feed it untrusted schemas.
-"""

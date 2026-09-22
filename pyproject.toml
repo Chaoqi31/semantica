@@ -231,10 +231,12 @@ gpu = [
 
 # ---- Agentic Framework Integrations ----
 agno = ["agno>=1.0.0"]
-# crewai core provides BaseTool and BaseKnowledgeSource; crewai-tools is not
-# needed (it pulls vulnerable transitive deps like chromadb) and would only
-# duplicate the prebuilt tooling users can install separately.
-crewai = ["crewai>=0.80.0"]
+# There is deliberately no `crewai` extra: crewai hard-requires
+# `chromadb~=1.1.0` and `json-repair~=0.25.2`, both of which carry critical
+# advisories (CVE-2026-45829/45830/45831/45833, GHSA-xf7x-x43h-rpqh) with no
+# fixed release on PyPI as of 2026-09. The integrations/crewai/ module still
+# works standalone — install `crewai` yourself if you want it, at your own
+# risk assessment — but semantica will not pull it in transitively.
 langchain = ["langchain-core>=0.3.0"]
 google-adk = ["google-adk>=1.27.0"]
 
@@ -278,10 +280,8 @@ explorer-lite = [
 ]
 
 # Everything (cross-platform — gpu excluded; install semantica[gpu] separately on Linux)
-# NOTE: the ``crewai`` extra is intentionally NOT in ``all``: crewai hard-requires
-# ``chromadb~=1.1.0``, which carries a pre-authentication code-injection advisory
-# (CVE-2026-45829) with no fixed release — including it here would fail the CI
-# dependency-audit/security gates.  Install it explicitly via ``semantica[crewai]``.
+# NOTE: there is no ``crewai`` extra to include here — see the comment above
+# the (removed) crewai entry under "Agentic Framework Integrations".
 all = [
   "semantica[viz,media,infra,cloud,monitoring,watch,llm-all,models-huggingface,embeddings-local,nlp-spacy,documents,ingest-git,graph-embeddings,split-all,graph-all,tripletstore-oxigraph,vectorstore-all,parse-docling,parse-pdf,ingest-parquet,ingest-arrow,shacl,explorer,agno,langchain,google-adk]"
 ]

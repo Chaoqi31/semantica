@@ -7,7 +7,7 @@ reasoning loop.
 
 Install
 -------
-    pip install semantica[crewai]
+    pip install crewai  # not a semantica extra — see integrations/crewai/README.md
 
 Example
 -------
