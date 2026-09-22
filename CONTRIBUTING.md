@@ -219,7 +219,7 @@ like `pip install -e ".[<name>]"`.
 
 `uv.lock` is a *universal* lock: it must resolve for every Python version in
 `requires-python` and covers the `dev` group and every optional extra
-(including `crewai`, which is excluded from `all`). After changing dependencies
+currently declared in `pyproject.toml`. After changing dependencies
 in `pyproject.toml`, refresh and commit it:
 
 ```bash

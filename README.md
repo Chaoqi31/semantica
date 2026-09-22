@@ -1317,7 +1317,7 @@ MCP setup takes 30 seconds — see [MCP Server](#mcp-server) below.
 <td align="center" width="12.5%">
 <a href="https://github.com/crewAIInc/crewAI"><img src="https://github.com/crewAIInc.png?size=120" alt="CrewAI" width="48" height="48" /></a><br/>
 <strong>CrewAI</strong><br/>
-<sub>First-class · <code>pip install crewai</code> alongside semantica</sub>
+<sub>First-class · <code>pip install "crewai>=0.80.0"</code> alongside semantica</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/langchain-ai/langchain"><img src="https://github.com/langchain-ai.png?size=120" alt="LangChain" width="48" height="48" /></a><br/>
@@ -1531,7 +1531,7 @@ pip install "semantica[ingest-git]"         # Git repository ingestor (GitPython
 pip install "semantica[vectorstore-faiss]"  # FAISS vector store
 pip install "semantica[vectorstore-all]"    # All vector stores (Qdrant, Pinecone, Weaviate, FAISS, PgVector, SQLite)
 pip install "semantica[agno]"               # Agno multi-agent integration
-pip install crewai                          # CrewAI integration (no semantica extra — see integrations/crewai/README.md)
+pip install "crewai>=0.80.0"                # CrewAI integration (no semantica extra — see integrations/crewai/README.md)
 pip install "semantica[langchain]"          # LangChain / LangGraph integration
 pip install "semantica[llm-all]"            # All LLM provider clients
 pip install "semantica[graph-neo4j]"        # Neo4j graph store (LPG)
