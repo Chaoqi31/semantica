@@ -138,14 +138,19 @@ class DecisionEmbeddingPipeline:
 
         # Initialize node embedder if graph store provided
         if graph_store:
-            self.node_embedder = node_embedder or NodeEmbedder(
-                method="node2vec",
-                embedding_dimension=node_embedding_dimension,
-                walk_length=80,
-                num_walks=10,
-                p=1.0,
-                q=1.0
-            )
+            if node_embedder is None:
+                try:
+                    node_embedder = NodeEmbedder(
+                        method="node2vec",
+                        embedding_dimension=node_embedding_dimension,
+                        walk_length=80,
+                        num_walks=10,
+                        p=1.0,
+                        q=1.0
+                    )
+                except ImportError as e:
+                    self.logger.warning(f"Structural embeddings disabled: {e}")
+            self.node_embedder = node_embedder
 
             # Initialize advanced KG algorithms if enabled
             if self.use_graph_features:
