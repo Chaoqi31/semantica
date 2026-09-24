@@ -521,13 +521,14 @@ class AgentMemory:
                             query=query, limit=max_results * 2
                         )
 
-                    vector_to_memory = {
-                        vector_id: memory_id
-                        for memory_id, vector_ids in self._vector_ids.items()
-                        for vector_id in vector_ids
-                    }
+                    with self._memory_lock:
+                        vector_to_memory = {
+                            vector_id: memory_id
+                            for memory_id, vector_ids in self._vector_ids.items()
+                            for vector_id in vector_ids
+                        }
                     for result in vector_results:
-                        memory_id = vector_to_memory.get(result.id, result.id)
+                        memory_id = vector_to_memory.get(str(result.id), result.id)
 
                         # Skip if already found in short-term
                         if memory_id in seen_ids:

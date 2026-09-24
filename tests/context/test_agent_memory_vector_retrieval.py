@@ -40,3 +40,27 @@ def test_retrieve_skips_vectors_that_are_not_memories(vector_store, memory):
 
     assert results
     assert {r["memory_id"] for r in results} <= set(memory.memory_items)
+
+
+class _IntIdStore:
+    def __init__(self):
+        self.vectors = []
+
+    def embed(self, text):
+        return [1.0, 1.0]
+
+    def store_vectors(self, vectors, metadata):
+        self.vectors.extend(vectors)
+        return [len(self.vectors) - 1]
+
+    def search_vectors(self, query_vector, k):
+        return [{"id": i, "score": 1.0} for i in range(len(self.vectors))][:k]
+
+
+def test_retrieve_maps_integer_vector_ids():
+    memory = AgentMemory(vector_store=_IntIdStore())
+    memory.store(REACTOR)
+
+    results = memory.retrieve(QUERY)
+
+    assert [r["content"] for r in results] == [REACTOR]
