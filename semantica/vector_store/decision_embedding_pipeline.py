@@ -203,7 +203,9 @@ class DecisionEmbeddingPipeline:
         )
         
         # Enrich metadata
-        enriched_metadata = self._enrich_metadata(decision_data)
+        enriched_metadata = self._enrich_metadata(
+            decision_data, structural_embedding is not None
+        )
         
         # Store embeddings if requested
         vector_id = None
@@ -714,7 +716,9 @@ class DecisionEmbeddingPipeline:
         
         return combined
     
-    def _enrich_metadata(self, decision_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _enrich_metadata(
+        self, decision_data: Dict[str, Any], has_structural_embedding: bool
+    ) -> Dict[str, Any]:
         """Enrich decision metadata with additional information."""
         metadata = decision_data.copy()
         
@@ -724,7 +728,7 @@ class DecisionEmbeddingPipeline:
             "embedding_generated_at": datetime.now(timezone.utc).isoformat(),
             "semantic_weight": self.semantic_weight,
             "structural_weight": self.structural_weight,
-            "has_structural_embedding": self.graph_store is not None
+            "has_structural_embedding": has_structural_embedding
         })
         
         return metadata

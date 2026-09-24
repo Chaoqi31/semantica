@@ -272,6 +272,12 @@ def test_agent_context_with_graph_builds_without_gensim():
     assert decision_id
     assert ctx.retriever.decision_pipeline.node_embedder is None
 
+    processed = ctx.retriever.decision_pipeline.process_decision(
+        {"scenario": "small business loan"}, store_embeddings=False
+    )
+    assert processed["structural_embedding"] is None
+    assert processed["metadata"]["has_structural_embedding"] is False
+
 
 def test_graph_components_without_gensim_keep_everything_but_node2vec():
     with patch("semantica.kg.node_embeddings.GENSIM_AVAILABLE", False):
